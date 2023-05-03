@@ -9,6 +9,7 @@ use {
         certificate::AppleCertificate,
         code_directory::CodeSignatureFlags,
         code_requirement::CodeRequirementExpression,
+        code_resources::CodeResourcesRule,
         embedded_signature::{Blob, DigestType, RequirementBlob},
         error::AppleCodesignError,
         macho::{parse_version_nibbles, MachFile},
@@ -254,6 +255,7 @@ pub struct SigningSettings<'key> {
     time_stamp_url: Option<Url>,
     digest_type: DigestType,
     path_exclusion_patterns: Vec<Pattern>,
+    regular_file_ruleset: Vec<CodeResourcesRule>,
 
     // Scope-specific settings.
     // These are BTreeMap so when we filter the keys, keys with higher precedence come
@@ -678,6 +680,14 @@ impl<'key> SigningSettings<'key> {
         self.info_plist_data.insert(scope, data);
     }
 
+    pub fn add_regular_file_ruleset(&mut self, rule: CodeResourcesRule) {
+        self.regular_file_ruleset.push(rule);
+    }
+
+    pub fn get_regular_file_ruleset(&self) -> &Vec<CodeResourcesRule> {
+        &self.regular_file_ruleset
+    }
+    
     /// Obtain the `CodeResources` XML file data registered to a given scope.
     pub fn code_resources_data(&self, scope: impl AsRef<SettingsScope>) -> Option<&[u8]> {
         self.code_resources_data
@@ -935,6 +945,7 @@ impl<'key> SigningSettings<'key> {
             team_id: self.team_id.clone(),
             digest_type: self.digest_type,
             path_exclusion_patterns: self.path_exclusion_patterns.clone(),
+            regular_file_ruleset: self.regular_file_ruleset.clone(),
             identifiers: self
                 .identifiers
                 .clone()
