@@ -680,7 +680,7 @@ impl<'key> SigningSettings<'key> {
         self.info_plist_data.insert(scope, data);
     }
 
-    pub fn add_regular_file_ruleset(&mut self, rule: CodeResourcesRule) {
+    pub fn add_regular_file_rule(&mut self, rule: CodeResourcesRule) {
         self.regular_file_ruleset.push(rule);
     }
 

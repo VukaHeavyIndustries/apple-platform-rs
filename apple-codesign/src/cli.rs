@@ -9,7 +9,7 @@ use {
         },
         code_directory::{CodeDirectoryBlob, CodeSignatureFlags},
         code_requirement::CodeRequirements,
-        CodeResourcesRule,
+        code_resources::CodeResourcesRule,
         cryptography::{parse_pfx_data, InMemoryPrivateKey, PrivateKey},
         embedded_signature::{Blob, CodeSigningSlot, DigestType, RequirementSetBlob},
         error::AppleCodesignError,
@@ -2240,7 +2240,7 @@ fn command_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
             let (_scope, value) = parse_scoped_value(value)?;
 
             let rule = CodeResourcesRule::new(value)?.weight(21);
-            settings.add_regular_file_ruleset(rule);
+            settings.add_regular_file_rule(rule);
         }
     }
 
@@ -2974,7 +2974,7 @@ pub fn main_impl() -> Result<(), AppleCodesignError> {
                     Arg::new("include_as_regular_files")
                         .long("include-as-regular-files")
                         .action(ArgAction::Append)
-                        .help("Include files as regular files using regex")
+                        .help("Include specified files as regular files during signing using regex matching rules")
                 )
                 .arg(
                     Arg::new("info_plist_path")
