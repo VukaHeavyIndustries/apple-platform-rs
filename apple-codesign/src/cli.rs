@@ -14,7 +14,6 @@ use {
         embedded_signature::{Blob, CodeSigningSlot, DigestType, RequirementSetBlob},
         error::AppleCodesignError,
         macho::MachFile,
-        notarization::Notarizer,
         reader::SignatureReader,
         remote_signing::{
             session_negotiation::{
@@ -26,9 +25,8 @@ use {
         signing::UnifiedSigner,
         signing_settings::{SettingsScope, SigningSettings},
     },
-    app_store_connect::UnifiedApiKey,
     base64::{engine::general_purpose::STANDARD as STANDARD_ENGINE, Engine},
-    clap::{value_parser, Arg, ArgAction, ArgGroup, ArgMatches, Command},
+    clap::{ArgAction, Args, Parser},
     cryptographic_message_syntax::SignedData,
     difference::{Changeset, Difference},
     log::{error, warn, LevelFilter},
@@ -36,6 +34,9 @@ use {
     std::{io::Write, path::PathBuf, str::FromStr},
     x509_certificate::{CapturedX509Certificate, EcdsaCurve, KeyAlgorithm, X509CertificateBuilder},
 };
+
+#[cfg(feature = "notarize")]
+use crate::notarization::Notarizer;
 
 #[cfg(feature = "yubikey")]
 use {
@@ -47,18 +48,6 @@ use {
 use crate::macos::{
     keychain_find_code_signing_certificates, macos_keychain_find_certificate_chain, KeychainDomain,
 };
-
-const ANALYZE_CERTIFICATE_ABOUT: &str = "\
-Analyze an X.509 certificate for Apple code signing properties.
-
-Given the path to a PEM encoded X.509 certificate, this command will read
-the certificate and print information about it relevant to Apple code
-signing.
-
-The output of the command can be useful to learn about X.509 certificate
-extensions used by code signing certificates and to debug low-level
-properties related to certificates.
-";
 
 const EXTRACT_ABOUT: &str = "\
 Extract code signature data from a Mach-O binary.
@@ -383,6 +372,8 @@ const SUPPORTED_HASHES: [&str; 6] = [
     "sha512",
 ];
 
+const KEYCHAIN_DOMAINS: [&str; 4] = ["user", "system", "common", "dynamic"];
+
 fn parse_scoped_value(s: &str) -> Result<(SettingsScope, &str), AppleCodesignError> {
     let parts = s.splitn(2, ':').collect::<Vec<_>>();
 
@@ -393,325 +384,343 @@ fn parse_scoped_value(s: &str) -> Result<(SettingsScope, &str), AppleCodesignErr
     }
 }
 
-fn remote_initialization_args(own: Option<&str>) -> Vec<&'static str> {
-    [
-        "remote_public_key",
-        "remote_public_key_pem_file",
-        "remote_shared_secret",
-        "remote_shared_secret_env",
-    ]
-    .into_iter()
-    .filter(|x| own != Some(*x))
-    .collect::<Vec<_>>()
+#[derive(Args, Clone)]
+struct CertificateSource {
+    /// Smartcard slot number of signing certificate to use (9c is common)
+    #[arg(long)]
+    smartcard_slot: Option<String>,
+
+    /// Environment variable holding the smartcard PIN
+    #[arg(long)]
+    smartcard_pin_env: Option<String>,
+
+    /// (macOS only) Keychain domain to operate on
+    #[arg(long, group = "keychain", value_parser = KEYCHAIN_DOMAINS)]
+    keychain_domain: Vec<String>,
+
+    /// (macOS only) SHA-256 fingerprint of certificate in Keychain to use
+    #[arg(long, group = "keychain")]
+    keychain_fingerprint: Option<String>,
+
+    /// Path to file containing PEM encoded certificate/key data
+    #[arg(long)]
+    pem_source: Vec<String>,
+
+    /// Path to file containing DER encoded certificate data
+    #[arg(long)]
+    der_source: Vec<String>,
+
+    /// Path to a .p12/PFX file containing a certificate key pair
+    #[arg(long = "p12-file", alias = "pfx-file")]
+    p12_path: Option<String>,
+
+    /// The password to use to open the --p12-file file
+    #[arg(long, alias = "pfx-password", group = "p12-password")]
+    p12_password: Option<String>,
+
+    // TODO conflicts with p12_password
+    /// Path to file containing password for opening --p12-file file
+    #[arg(long, alias = "pfx-password-file", group = "p12-password")]
+    p12_password_file: Option<String>,
+
+    /// Send signing requests to a remote signer
+    #[arg(long)]
+    remote_signer: bool,
+
+    /// Base64 encoded public key data describing the signer
+    #[arg(long, group = "remote-initialization")]
+    remote_public_key: Option<String>,
+
+    /// PEM encoded public key data describing the signer
+    #[arg(long, group = "remote-initialization", group = "remote-initialization")]
+    remote_public_key_pem_file: Option<String>,
+
+    /// Shared secret used for remote signing
+    #[arg(long, group = "remote-initialization")]
+    remote_shared_secret: Option<String>,
+
+    /// Environment variable holding the shared secret used for remote signing
+    #[arg(long, group = "remote-initialization")]
+    remote_shared_secret_env: Option<String>,
+
+    /// URL of a remote code signing server
+    #[arg(long, default_value = crate::remote_signing::DEFAULT_SERVER_URL)]
+    remote_signing_url: String,
 }
 
-fn add_certificate_source_args(app: Command) -> Command {
-    app.arg(
-        Arg::new("smartcard_slot")
-            .long("smartcard-slot")
-            .action(ArgAction::Set)
-            .help("Smartcard slot number of signing certificate to use (9c is common)"),
-    )
-    .arg(
-        Arg::new("keychain_domain")
-            .long("keychain-domain")
-            .action(ArgAction::Append)
-            .value_parser(["user", "system", "common", "dynamic"])
-            .help("(macOS only) Keychain domain to operate on"),
-    )
-    .arg(
-        Arg::new("keychain_fingerprint")
-            .long("keychain-fingerprint")
-            .action(ArgAction::Set)
-            .help("(macOS only) SHA-256 fingerprint of certificate in Keychain to use"),
-    )
-    .arg(
-        Arg::new("pem_source")
-            .long("pem-source")
-            .action(ArgAction::Append)
-            .help("Path to file containing PEM encoded certificate/key data"),
-    )
-    .arg(
-        Arg::new("der_source")
-            .long("der-source")
-            .action(ArgAction::Append)
-            .help("Path to file containing DER encoded certificate data"),
-    )
-    .arg(
-        Arg::new("p12_path")
-            .long("p12-file")
-            .alias("pfx-file")
-            .action(ArgAction::Set)
-            .help("Path to a .p12/PFX file containing a certificate key pair"),
-    )
-    .arg(
-        Arg::new("p12_password")
-            .long("p12-password")
-            .alias("pfx-password")
-            .action(ArgAction::Set)
-            .help("The password to use to open the --p12-file file"),
-    )
-    .arg(
-        Arg::new("p12_password_file")
-            .long("p12-password-file")
-            .alias("pfx-password-file")
-            .conflicts_with("p12_password")
-            .action(ArgAction::Set)
-            .help("Path to file containing password for opening --p12-file file"),
-    )
-    .arg(
-        Arg::new("remote_signer")
-            .long("remote-signer")
-            .action(ArgAction::SetTrue)
-            .requires("remote_initialization")
-            .help("Send signing requests to a remote server"),
-    )
-    .arg(
-        Arg::new("remote_public_key")
-            .long("remote-public-key")
-            .action(ArgAction::Set)
-            .conflicts_with_all(remote_initialization_args(Some("remote_public_key")))
-            .help("Base64 encoded public key data describing the signer"),
-    )
-    .arg(
-        Arg::new("remote_public_key_pem_file")
-            .long("remote-public-key-pem-file")
-            .action(ArgAction::Set)
-            .conflicts_with_all(remote_initialization_args(Some(
-                "remote_public_key_pem_file",
-            )))
-            .help("PEM encoded public key data describing the signer"),
-    )
-    .arg(
-        Arg::new("remote_shared_secret")
-            .long("remote-shared-secret")
-            .conflicts_with_all(remote_initialization_args(Some("remote_shared_secret")))
-            .action(ArgAction::Set)
-            .help("Shared secret used for remote signing"),
-    )
-    .arg(
-        Arg::new("remote_shared_secret_env")
-            .long("remote-shared-secret-env")
-            .conflicts_with_all(remote_initialization_args(Some("remote_shared_secret_env")))
-            .action(ArgAction::Set)
-            .help("Environment variable holding the shared secret used for remote signing"),
-    )
-    .arg(
-        Arg::new("remote_signing_url")
-            .long("remote-signing-url")
-            .action(ArgAction::Set)
-            .default_value(crate::remote_signing::DEFAULT_SERVER_URL)
-            .help("URL of a remote code signing server"),
-    )
-    .group(ArgGroup::new("keychain").args(["keychain_domain", "keychain_fingerprint"]))
-    .group(ArgGroup::new("remote_initialization").args(remote_initialization_args(None)))
-}
+impl CertificateSource {
+    fn resolve_certificates(
+        &self,
+        scan_smartcard: bool,
+    ) -> Result<(Vec<Box<dyn PrivateKey>>, Vec<CapturedX509Certificate>), AppleCodesignError> {
+        let mut keys: Vec<Box<dyn PrivateKey>> = vec![];
+        let mut certs = vec![];
 
-fn get_remote_signing_initiator(
-    args: &ArgMatches,
-) -> Result<Box<dyn SessionInitiatePeer>, RemoteSignError> {
-    let server_url = args
-        .get_one::<String>("remote_signing_url")
-        .map(|x| x.to_string());
+        if let Some(p12_path) = &self.p12_path {
+            let p12_data = std::fs::read(p12_path)?;
 
-    if let Some(public_key_data) = args.get_one::<String>("remote_public_key") {
-        let public_key_data = STANDARD_ENGINE.decode(public_key_data)?;
+            let p12_password = if let Some(password) = &self.p12_password {
+                password.to_string()
+            } else if let Some(path) = &self.p12_password_file {
+                std::fs::read_to_string(path)?
+                    .lines()
+                    .next()
+                    .expect("should get a single line")
+                    .to_string()
+            } else {
+                dialoguer::Password::new()
+                    .with_prompt("Please enter password for p12 file")
+                    .interact()?
+            };
 
-        Ok(Box::new(PublicKeyInitiator::new(
-            public_key_data,
-            server_url,
-        )?))
-    } else if let Some(path) = args.get_one::<String>("remote_public_key_pem_file") {
-        let pem_data = std::fs::read(path)?;
-        let doc = pem::parse(pem_data)?;
+            let (cert, key) = parse_pfx_data(&p12_data, &p12_password)?;
 
-        let spki_der = match doc.tag.as_str() {
-            "PUBLIC KEY" => doc.contents,
-            "CERTIFICATE" => {
-                let cert = CapturedX509Certificate::from_der(doc.contents)?;
-                cert.to_public_key_der()?.as_ref().to_vec()
-            }
-            tag => {
-                error!(
-                    "unknown PEM format: {}; only `PUBLIC KEY` and `CERTIFICATE` are parsed",
-                    tag
-                );
-                return Err(RemoteSignError::Crypto("invalid public key data".into()));
-            }
-        };
+            keys.push(Box::new(key));
+            certs.push(cert);
+        }
 
-        Ok(Box::new(PublicKeyInitiator::new(spki_der, server_url)?))
-    } else if let Some(env) = args.get_one::<String>("remote_shared_secret_env") {
-        let secret = std::env::var(env).map_err(|_| {
-            RemoteSignError::ClientState("failed reading from shared secret environment variable")
-        })?;
-
-        Ok(Box::new(SharedSecretInitiator::new(
-            secret.as_bytes().to_vec(),
-        )?))
-    } else if let Some(value) = args.get_one::<String>("remote_shared_secret") {
-        Ok(Box::new(SharedSecretInitiator::new(
-            value.as_bytes().to_vec(),
-        )?))
-    } else {
-        error!("no arguments provided to establish session with remote signer");
-        error!(
-            "specify --remote-public-key, --remote-shared-secret-env, or --remote-shared-secret"
-        );
-        Err(RemoteSignError::ClientState(
-            "unable to initiate remote signing",
-        ))
-    }
-}
-
-#[allow(clippy::type_complexity)]
-fn collect_certificates_from_args(
-    args: &ArgMatches,
-    scan_smartcard: bool,
-) -> Result<(Vec<Box<dyn PrivateKey>>, Vec<CapturedX509Certificate>), AppleCodesignError> {
-    let mut keys: Vec<Box<dyn PrivateKey>> = vec![];
-    let mut certs = vec![];
-
-    if let Some(p12_path) = args.get_one::<String>("p12_path") {
-        let p12_data = std::fs::read(p12_path)?;
-
-        let p12_password = if let Some(password) = args.get_one::<String>("p12_password") {
-            password.to_string()
-        } else if let Some(path) = args.get_one::<String>("p12_password_file") {
-            std::fs::read_to_string(path)?
-                .lines()
-                .next()
-                .expect("should get a single line")
-                .to_string()
-        } else {
-            dialoguer::Password::new()
-                .with_prompt("Please enter password for p12 file")
-                .interact()?
-        };
-
-        let (cert, key) = parse_pfx_data(&p12_data, &p12_password)?;
-
-        keys.push(Box::new(key));
-        certs.push(cert);
-    }
-
-    if let Some(values) = args.get_many::<String>("pem_source") {
-        for pem_source in values {
+        for pem_source in &self.pem_source {
             warn!("reading PEM data from {}", pem_source);
             let pem_data = std::fs::read(pem_source)?;
 
             for pem in pem::parse_many(pem_data).map_err(AppleCodesignError::CertificatePem)? {
-                match pem.tag.as_str() {
+                match pem.tag() {
                     "CERTIFICATE" => {
-                        certs.push(CapturedX509Certificate::from_der(pem.contents)?);
+                        certs.push(CapturedX509Certificate::from_der(pem.contents())?);
                     }
                     "PRIVATE KEY" => {
-                        keys.push(Box::new(InMemoryPrivateKey::from_pkcs8_der(&pem.contents)?));
+                        keys.push(Box::new(InMemoryPrivateKey::from_pkcs8_der(
+                            pem.contents(),
+                        )?));
                     }
                     "RSA PRIVATE KEY" => {
-                        keys.push(Box::new(InMemoryPrivateKey::from_pkcs1_der(&pem.contents)?));
+                        keys.push(Box::new(InMemoryPrivateKey::from_pkcs1_der(
+                            pem.contents(),
+                        )?));
                     }
                     tag => warn!("(unhandled PEM tag {}; ignoring)", tag),
                 }
             }
         }
-    }
 
-    if let Some(values) = args.get_many::<String>("der_source") {
-        for der_source in values {
+        for der_source in &self.der_source {
             warn!("reading DER file {}", der_source);
             let der_data = std::fs::read(der_source)?;
 
             certs.push(CapturedX509Certificate::from_der(der_data)?);
         }
-    }
 
-    find_certificates_in_keychain(args, &mut keys, &mut certs)?;
+        self.find_certificates_in_keychain(&mut keys, &mut certs)?;
 
-    if scan_smartcard {
-        if let Some(slot) = args.get_one::<String>("smartcard_slot") {
-            let pin_env_var = args.get_one::<String>("smartcard_pin_env");
-            handle_smartcard_sign_slot(slot, pin_env_var.map(|x| &**x), &mut keys, &mut certs)?;
+        if scan_smartcard {
+            if let Some(slot) = &self.smartcard_slot {
+                handle_smartcard_sign_slot(
+                    slot,
+                    self.smartcard_pin_env.as_ref().map(|x| x.as_str()),
+                    &mut keys,
+                    &mut certs,
+                )?;
+            }
         }
+
+        let remote_signing_url = if self.remote_signer {
+            Some(self.remote_signing_url.clone())
+        } else {
+            None
+        };
+
+        if let Some(remote_signing_url) = remote_signing_url {
+            let initiator = self.get_remote_signing_initiator()?;
+
+            let client = UnjoinedSigningClient::new_initiator(
+                remote_signing_url,
+                initiator,
+                Some(print_session_join),
+            )?;
+
+            // As part of the handshake we obtained the public certificates from the signer.
+            // So make them the canonical set.
+            if !certs.is_empty() {
+                warn!(
+                    "ignoring {} local certificates and using remote signer's certificate(s)",
+                    certs.len()
+                );
+            }
+
+            certs = vec![client.signing_certificate().clone()];
+            certs.extend(client.certificate_chain().iter().cloned());
+
+            // The client implements Sign, so we just use it as the private key.
+            keys = vec![Box::new(client)];
+        }
+
+        Ok((keys, certs))
     }
 
-    let remote_signing_url = if args.get_flag("remote_signer") {
-        args.get_one::<String>("remote_signing_url")
-    } else {
-        None
-    };
+    #[cfg(target_os = "macos")]
+    fn find_certificates_in_keychain(
+        &self,
+        private_keys: &mut Vec<Box<dyn PrivateKey>>,
+        public_certificates: &mut Vec<CapturedX509Certificate>,
+    ) -> Result<(), AppleCodesignError> {
+        // No arguments pertinent to keychains. Don't even speak to the
+        // keychain API since this could only error.
+        if self.keychain_domain.is_empty() && self.keychain_fingerprint.is_none() {
+            return Ok(());
+        }
 
-    if let Some(remote_signing_url) = remote_signing_url {
-        let initiator = get_remote_signing_initiator(args)?;
+        // Collect all the keychain domains to search.
+        let domains = if self.keychain_domain.is_empty() {
+            vec!["user".to_string()]
+        } else {
+            self.keychain_domain.clone()
+        };
 
-        let client = UnjoinedSigningClient::new_initiator(
-            remote_signing_url,
-            initiator,
-            Some(print_session_join),
-        )?;
+        let domains = domains
+            .into_iter()
+            .map(|domain| {
+                KeychainDomain::try_from(domain.as_str())
+                    .expect("clap should have validated domain values")
+            })
+            .collect::<Vec<_>>();
 
-        // As part of the handshake we obtained the public certificates from the signer.
-        // So make them the canonical set.
-        if !certs.is_empty() {
-            warn!(
-                "ignoring {} local certificates and using remote signer's certificate(s)",
-                certs.len()
+        // Now iterate all the keychains and try to find requested certificates.
+
+        for domain in domains {
+            for cert in keychain_find_code_signing_certificates(domain, None)? {
+                let matches = if let Some(wanted_fingerprint) = &self.keychain_fingerprint {
+                    let got_fingerprint = hex::encode(cert.sha256_fingerprint()?.as_ref());
+
+                    wanted_fingerprint.to_ascii_lowercase() == got_fingerprint.to_ascii_lowercase()
+                } else {
+                    false
+                };
+
+                if matches {
+                    public_certificates.push(cert.as_captured_x509_certificate());
+                    private_keys.push(Box::new(cert));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn find_certificates_in_keychain(
+        &self,
+        _private_keys: &mut [Box<dyn PrivateKey>],
+        _public_certificates: &mut [CapturedX509Certificate],
+    ) -> Result<(), AppleCodesignError> {
+        if !self.keychain_domain.is_empty() || self.keychain_fingerprint.is_some() {
+            error!(
+                "--keychain* arguments only supported on macOS and will be ignored on this platform"
             );
         }
 
-        certs = vec![client.signing_certificate().clone()];
-        certs.extend(client.certificate_chain().iter().cloned());
-
-        // The client implements Sign, so we just use it as the private key.
-        keys = vec![Box::new(client)];
+        Ok(())
     }
 
-    Ok((keys, certs))
+    fn get_remote_signing_initiator(
+        &self,
+    ) -> Result<Box<dyn SessionInitiatePeer>, RemoteSignError> {
+        let server_url = self.remote_signing_url.clone();
+
+        if let Some(public_key_data) = &self.remote_public_key {
+            let public_key_data = STANDARD_ENGINE.decode(public_key_data)?;
+
+            Ok(Box::new(PublicKeyInitiator::new(
+                public_key_data,
+                Some(server_url),
+            )?))
+        } else if let Some(path) = &self.remote_public_key_pem_file {
+            let pem_data = std::fs::read(path)?;
+            let doc = pem::parse(pem_data)?;
+
+            let spki_der = match doc.tag() {
+                "PUBLIC KEY" => doc.contents().to_vec(),
+                "CERTIFICATE" => {
+                    let cert = CapturedX509Certificate::from_der(doc.contents())?;
+                    cert.to_public_key_der()?.as_ref().to_vec()
+                }
+                tag => {
+                    error!(
+                        "unknown PEM format: {}; only `PUBLIC KEY` and `CERTIFICATE` are parsed",
+                        tag
+                    );
+                    return Err(RemoteSignError::Crypto("invalid public key data".into()));
+                }
+            };
+
+            Ok(Box::new(PublicKeyInitiator::new(
+                spki_der,
+                Some(server_url),
+            )?))
+        } else if let Some(env) = &self.remote_shared_secret_env {
+            let secret = std::env::var(env).map_err(|_| {
+                RemoteSignError::ClientState(
+                    "failed reading from shared secret environment variable",
+                )
+            })?;
+
+            Ok(Box::new(SharedSecretInitiator::new(
+                secret.as_bytes().to_vec(),
+            )?))
+        } else if let Some(value) = &self.remote_shared_secret {
+            Ok(Box::new(SharedSecretInitiator::new(
+                value.as_bytes().to_vec(),
+            )?))
+        } else {
+            error!("no arguments provided to establish session with remote signer");
+            error!(
+            "specify --remote-public-key, --remote-shared-secret-env, or --remote-shared-secret"
+        );
+            Err(RemoteSignError::ClientState(
+                "unable to initiate remote signing",
+            ))
+        }
+    }
 }
 
-/// Add arguments common to commands that interact with the Notary API.
-fn add_notary_api_args(app: Command) -> Command {
-    app.arg(
-        Arg::new("api_key_path")
-            .long("api-key-path")
-            .action(ArgAction::Set)
-            .value_parser(value_parser!(PathBuf))
-            .conflicts_with_all(["api_issuer", "api_key"])
-            .help("Path to a JSON file containing the API Key"),
-    )
-    .arg(
-        Arg::new("api_issuer")
-            .long("api-issuer")
-            .action(ArgAction::Set)
-            .requires("api_key")
-            .help("App Store Connect Issuer ID (likely a UUID)"),
-    )
-    .arg(
-        Arg::new("api_key")
-            .long("api-key")
-            .action(ArgAction::Set)
-            .requires("api_issuer")
-            .help("App Store Connect API Key ID"),
-    )
+#[cfg(feature = "notarize")]
+#[derive(Args)]
+struct NotaryApi {
+    /// Path to a JSON file containing the API Key
+    #[arg(long, group = "source")]
+    api_key_path: Option<PathBuf>,
+
+    /// App Store Connect Issuer ID (likely a UUID)
+    #[arg(long, requires = "api_key")]
+    api_issuer: Option<String>,
+
+    #[arg(long, requires = "api_issuer")]
+    /// App Store Connect API Key ID
+    api_key: Option<String>,
 }
 
-fn add_yubikey_policy_args(app: Command) -> Command {
-    app.arg(
-        Arg::new("touch_policy")
-            .long("touch-policy")
-            .action(ArgAction::Set)
-            .value_parser(["default", "always", "never", "cached"])
-            .default_value("default")
-            .help("Smartcard touch policy to protect key access"),
-    )
-    .arg(
-        Arg::new("pin_policy")
-            .long("pin-policy")
-            .action(ArgAction::Set)
-            .value_parser(["default", "never", "once", "always"])
-            .default_value("default")
-            .help("Smartcard pin prompt policy to protect key access"),
-    )
+#[cfg(feature = "notarize")]
+impl NotaryApi {
+    /// Resolve a notarizer from arguments.
+    fn notarizer(&self) -> Result<Notarizer, AppleCodesignError> {
+        if let Some(api_key_path) = &self.api_key_path {
+            Notarizer::from_api_key(api_key_path)
+        } else if let (Some(issuer), Some(key)) = (&self.api_issuer, &self.api_key) {
+            Notarizer::from_api_key_id(issuer, key)
+        } else {
+            Err(AppleCodesignError::NotarizeNoAuthCredentials)
+        }
+    }
+}
+
+#[derive(Parser)]
+struct YubikeyPolicy {
+    /// Smartcard touch policy to protect key access
+    #[arg(long, value_parser = ["default", "always", "never", "cached"], default_value = "default")]
+    touch_policy: String,
+
+    /// Smartcard pin prompt policy to protect key access
+    #[arg(long, value_parser = ["default", "never", "once", "always"], default_value = "default")]
+    pin_policy: String,
 }
 
 #[cfg(feature = "yubikey")]
@@ -914,76 +923,14 @@ fn handle_smartcard_sign_slot(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn find_certificates_in_keychain(
-    args: &ArgMatches,
-    private_keys: &mut Vec<Box<dyn PrivateKey>>,
-    public_certificates: &mut Vec<CapturedX509Certificate>,
-) -> Result<(), AppleCodesignError> {
-    // No arguments pertinent to keychains. Don't even speak to the
-    // keychain API since this could only error.
-    if !args.contains_id("keychain") {
-        return Ok(());
-    }
-
-    // Collect all the keychain domains to search.
-    let domains = if let Some(domains) = args.get_many::<String>("keychain_domain") {
-        domains
-            .into_iter()
-            .map(|x| x.to_string())
-            .collect::<Vec<_>>()
-    } else {
-        vec!["user".to_string()]
-    };
-
-    let domains = domains
-        .into_iter()
-        .map(|domain| {
-            KeychainDomain::try_from(domain.as_str())
-                .expect("clap should have validated domain values")
-        })
-        .collect::<Vec<_>>();
-
-    // Now iterate all the keychains and try to find requested certificates.
-
-    for domain in domains {
-        for cert in keychain_find_code_signing_certificates(domain, None)? {
-            let matches =
-                if let Some(wanted_fingerprint) = args.get_one::<String>("keychain_fingerprint") {
-                    let got_fingerprint = hex::encode(cert.sha256_fingerprint()?.as_ref());
-
-                    wanted_fingerprint.to_ascii_lowercase() == got_fingerprint.to_ascii_lowercase()
-                } else {
-                    false
-                };
-
-            if matches {
-                public_certificates.push(cert.as_captured_x509_certificate());
-                private_keys.push(Box::new(cert));
-            }
-        }
-    }
-
-    Ok(())
+#[derive(Parser)]
+struct AnalyzeCertificate {
+    #[command(flatten)]
+    certificate: CertificateSource,
 }
 
-#[cfg(not(target_os = "macos"))]
-fn find_certificates_in_keychain(
-    args: &ArgMatches,
-    _private_keys: &mut [Box<dyn PrivateKey>],
-    _public_certificates: &mut [CapturedX509Certificate],
-) -> Result<(), AppleCodesignError> {
-    if args.contains_id("keychain") {
-        error!(
-            "--keychain* arguments only supported on macOS and will be ignored on this platform"
-        );
-    }
-
-    Ok(())
-}
-
-fn command_analyze_certificate(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let certs = collect_certificates_from_args(args, true)?.1;
+fn command_analyze_certificate(args: &AnalyzeCertificate) -> Result<(), AppleCodesignError> {
+    let certs = args.certificate.resolve_certificates(true)?.1;
 
     for (i, cert) in certs.into_iter().enumerate() {
         println!("# Certificate {i}");
@@ -995,24 +942,32 @@ fn command_analyze_certificate(args: &ArgMatches) -> Result<(), AppleCodesignErr
     Ok(())
 }
 
-fn command_compute_code_hashes(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let path = args
-        .get_one::<String>("path")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
-    let index = args.get_one::<String>("universal_index").unwrap();
-    let index = usize::from_str(index).map_err(|_| AppleCodesignError::CliBadArgument)?;
-    let hash_type = DigestType::try_from(args.get_one::<String>("hash").unwrap().as_str())?;
-    let page_size = usize::from_str(
-        args.get_one::<String>("page_size")
-            .expect("page_size should have default value"),
-    )
-    .map_err(|_| AppleCodesignError::CliBadArgument)?;
+#[derive(Parser)]
+struct ComputeCodeHashes {
+    /// Path to Mach-O binary to examine.
+    path: PathBuf,
 
-    let data = std::fs::read(path)?;
+    /// Hashing algorithm to use.
+    #[arg(long, value_parser = SUPPORTED_HASHES, default_value = "sha256")]
+    hash: String,
+
+    /// Chunk size to digest over.
+    #[arg(long, default_value = "4096")]
+    page_size: usize,
+
+    /// Index of Mach-O binary to operate on within a universal/fat binary
+    #[arg(long, default_value = "0")]
+    universal_index: usize,
+}
+
+fn command_compute_code_hashes(args: &ComputeCodeHashes) -> Result<(), AppleCodesignError> {
+    let hash_type = DigestType::try_from(args.hash.as_str())?;
+
+    let data = std::fs::read(&args.path)?;
     let mach = MachFile::parse(&data)?;
-    let macho = mach.nth_macho(index)?;
+    let macho = mach.nth_macho(args.universal_index)?;
 
-    let hashes = macho.code_digests(hash_type, page_size)?;
+    let hashes = macho.code_digests(hash_type, args.page_size)?;
 
     for hash in hashes {
         println!("{}", hex::encode(hash));
@@ -1021,19 +976,21 @@ fn command_compute_code_hashes(args: &ArgMatches) -> Result<(), AppleCodesignErr
     Ok(())
 }
 
-fn command_diff_signatures(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let path0 = args
-        .get_one::<String>("path0")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
-    let path1 = args
-        .get_one::<String>("path1")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
+#[derive(Parser)]
+struct DiffSignatures {
+    /// The first path to compare
+    path0: PathBuf,
 
-    let reader = SignatureReader::from_path(path0)?;
+    /// The second path to compare
+    path1: PathBuf,
+}
+
+fn command_diff_signatures(args: &DiffSignatures) -> Result<(), AppleCodesignError> {
+    let reader = SignatureReader::from_path(&args.path0)?;
 
     let a_entities = reader.entities()?;
 
-    let reader = SignatureReader::from_path(path1)?;
+    let reader = SignatureReader::from_path(&args.path1)?;
     let b_entities = reader.entities()?;
 
     let a = serde_yaml::to_string(&a_entities)?;
@@ -1064,6 +1021,7 @@ fn command_diff_signatures(args: &ArgMatches) -> Result<(), AppleCodesignError> 
     Ok(())
 }
 
+#[cfg(feature = "notarize")]
 const ENCODE_APP_STORE_CONNECT_API_KEY_ABOUT: &str = "\
 Encode an App Store Connect API Key to JSON.
 
@@ -1097,20 +1055,34 @@ want. Security conscious individuals should audit the permissions of the
 file and adjust accordingly.
 ";
 
-fn command_encode_app_store_connect_api_key(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let issuer_id = args
-        .get_one::<String>("issuer_id")
-        .expect("arg should have been required");
-    let key_id = args
-        .get_one::<String>("key_id")
-        .expect("arg should have been required");
-    let private_key_path = args
-        .get_one::<PathBuf>("private_key_path")
-        .expect("arg should have been required");
+#[cfg(feature = "notarize")]
+#[derive(Parser)]
+struct EncodeAppStoreConnectApiKey {
+    /// Path to a JSON file to create the output to
+    #[arg(short = 'o', long)]
+    output_path: Option<PathBuf>,
 
-    let unified = UnifiedApiKey::from_ecdsa_pem_path(issuer_id, key_id, private_key_path)?;
+    /// The issuer of the API Token. Likely a UUID
+    issuer_id: String,
 
-    if let Some(output_path) = args.get_one::<PathBuf>("output_path") {
+    /// The Key ID. A short alphanumeric string like DEADBEEF42
+    key_id: String,
+
+    /// Path to a file containing the private key downloaded from Apple
+    private_key_path: PathBuf,
+}
+
+#[cfg(feature = "notarize")]
+fn command_encode_app_store_connect_api_key(
+    args: &EncodeAppStoreConnectApiKey,
+) -> Result<(), AppleCodesignError> {
+    let unified = app_store_connect::UnifiedApiKey::from_ecdsa_pem_path(
+        &args.issuer_id,
+        &args.key_id,
+        &args.private_key_path,
+    )?;
+
+    if let Some(output_path) = &args.output_path {
         eprintln!("writing unified key JSON to {}", output_path.display());
         unified.write_json_file(output_path)?;
         eprintln!(
@@ -1282,21 +1254,50 @@ fn print_signed_data(
     Ok(())
 }
 
-fn command_extract(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let path = args
-        .get_one::<String>("path")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
-    let format = args
-        .get_one::<String>("data")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
-    let index = args.get_one::<String>("universal_index").unwrap();
-    let index = usize::from_str(index).map_err(|_| AppleCodesignError::CliBadArgument)?;
+const EXTRACT_DATA: [&str; 21] = [
+    "blobs",
+    "cms-info",
+    "cms-pem",
+    "cms-raw",
+    "cms",
+    "code-directory-raw",
+    "code-directory-serialized-raw",
+    "code-directory-serialized",
+    "code-directory",
+    "linkedit-info",
+    "linkedit-segment-raw",
+    "macho-load-commands",
+    "macho-segments",
+    "macho-target",
+    "requirements-raw",
+    "requirements-rust",
+    "requirements-serialized-raw",
+    "requirements-serialized",
+    "requirements",
+    "signature-raw",
+    "superblob",
+];
 
-    let data = std::fs::read(path)?;
+#[derive(Parser)]
+struct Extract {
+    /// Path to Mach-O binary to examine
+    path: PathBuf,
+
+    /// Which data to extract and how to format it
+    #[arg(long, value_parser = EXTRACT_DATA, default_value = "linkedit-info")]
+    data: String,
+
+    /// Index of Mach-O binary to operate on within a universal/fat binary
+    #[arg(long, default_value = "0")]
+    universal_index: usize,
+}
+
+fn command_extract(args: &Extract) -> Result<(), AppleCodesignError> {
+    let data = std::fs::read(&args.path)?;
     let mach = MachFile::parse(&data)?;
-    let macho = mach.nth_macho(index)?;
+    let macho = mach.nth_macho(args.universal_index)?;
 
-    match format.as_str() {
+    match args.data.as_str() {
         "blobs" => {
             let embedded = macho
                 .code_signature()?
@@ -1332,13 +1333,7 @@ fn command_extract(args: &ArgMatches) -> Result<(), AppleCodesignError> {
                 .ok_or(AppleCodesignError::BinaryNoCodeSignature)?;
 
             if let Some(cms) = embedded.signature_data()? {
-                print!(
-                    "{}",
-                    pem::encode(&pem::Pem {
-                        tag: "PKCS7".to_string(),
-                        contents: cms.to_vec(),
-                    })
-                );
+                print!("{}", pem::encode(&pem::Pem::new("PKCS7", cms.to_vec())));
             } else {
                 eprintln!("no CMS data");
             }
@@ -1640,18 +1635,26 @@ fn command_extract(args: &ArgMatches) -> Result<(), AppleCodesignError> {
                 );
             }
         }
-        _ => panic!("unhandled format: {format}"),
+        x => panic!("unhandled format: {x}"),
     }
 
     Ok(())
 }
 
-fn command_generate_certificate_signing_request(
-    args: &ArgMatches,
-) -> Result<(), AppleCodesignError> {
-    let csr_pem_path = args.get_one::<String>("csr_pem_path").map(PathBuf::from);
+#[derive(Parser)]
+struct GenerateCertificateSigningRequest {
+    /// Path to file to write PEM encoded CSR to
+    #[arg(long)]
+    csr_pem_path: Option<PathBuf>,
 
-    let (private_keys, _) = collect_certificates_from_args(args, true)?;
+    #[command(flatten)]
+    certificate: CertificateSource,
+}
+
+fn command_generate_certificate_signing_request(
+    args: &GenerateCertificateSigningRequest,
+) -> Result<(), AppleCodesignError> {
+    let private_keys = args.certificate.resolve_certificates(true)?.0;
 
     let private_key = if private_keys.is_empty() {
         error!("no private keys found; a private key is required to sign a certificate signing request");
@@ -1682,7 +1685,7 @@ fn command_generate_certificate_signing_request(
         .create_certificate_signing_request(private_key.as_key_info_signer())?
         .encode_pem()?;
 
-    if let Some(dest_path) = csr_pem_path {
+    if let Some(dest_path) = &args.csr_pem_path {
         if let Some(parent) = dest_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1696,57 +1699,64 @@ fn command_generate_certificate_signing_request(
     Ok(())
 }
 
-fn command_generate_self_signed_certificate(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let algorithm = match args
-        .get_one::<String>("algorithm")
-        .ok_or(AppleCodesignError::CliBadArgument)?
-        .as_str()
-    {
+#[derive(Parser)]
+struct GenerateSelfSignedCertificate {
+    /// Which key type to use
+    #[arg(long, value_parser = ["ecdsa", "ed25519"], default_value = "ecdsa")]
+    algorithm: String,
+
+    #[arg(long, value_parser = CertificateProfile::str_names(), default_value = "apple-development")]
+    profile: String,
+
+    /// Team ID (this is a short string attached to your Apple Developer account)
+    #[arg(long, default_value = "unset")]
+    team_id: String,
+
+    /// The name of the person this certificate is for
+    #[arg(long)]
+    person_name: String,
+
+    /// Country Name (C) value for certificate identifier
+    #[arg(long, default_value = "XX")]
+    country_name: String,
+
+    /// How many days the certificate should be valid for
+    #[arg(long, default_value = "365")]
+    validity_days: i64,
+
+    /// Base name of files to write PEM encoded certificate to
+    #[arg(long)]
+    pem_filename: Option<String>,
+}
+
+fn command_generate_self_signed_certificate(
+    args: &GenerateSelfSignedCertificate,
+) -> Result<(), AppleCodesignError> {
+    let algorithm = match args.algorithm.as_str() {
         "ecdsa" => KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1),
         "ed25519" => KeyAlgorithm::Ed25519,
         value => panic!("algorithm values should have been validated by arg parser: {value}"),
     };
 
-    let profile = args
-        .get_one::<String>("profile")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
-    let profile = CertificateProfile::from_str(profile)?;
-    let team_id = args
-        .get_one::<String>("team_id")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
-    let person_name = args
-        .get_one::<String>("person_name")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
-    let country_name = args
-        .get_one::<String>("country_name")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
+    let profile = CertificateProfile::from_str(args.profile.as_str())?;
 
-    let validity_days = args.get_one::<String>("validity_days").unwrap();
-    let validity_days =
-        i64::from_str(validity_days).map_err(|_| AppleCodesignError::CliBadArgument)?;
-
-    let pem_filename = args.get_one::<String>("pem_filename");
-
-    let validity_duration = chrono::Duration::days(validity_days);
+    let validity_duration = chrono::Duration::days(args.validity_days);
 
     let (cert, _, raw) = create_self_signed_code_signing_certificate(
         algorithm,
         profile,
-        team_id,
-        person_name,
-        country_name,
+        &args.team_id,
+        &args.person_name,
+        &args.country_name,
         validity_duration,
     )?;
 
     let cert_pem = cert.encode_pem();
-    let key_pem = pem::encode(&pem::Pem {
-        tag: "PRIVATE KEY".to_string(),
-        contents: raw.as_ref().to_vec(),
-    });
+    let key_pem = pem::encode(&pem::Pem::new("PRIVATE KEY", raw.as_ref().to_vec()));
 
     let mut wrote_file = false;
 
-    if let Some(pem_filename) = pem_filename {
+    if let Some(pem_filename) = &args.pem_filename {
         let cert_path = PathBuf::from(format!("{pem_filename}.crt"));
         let key_path = PathBuf::from(format!("{pem_filename}.key"));
 
@@ -1770,18 +1780,37 @@ fn command_generate_self_signed_certificate(args: &ArgMatches) -> Result<(), App
     Ok(())
 }
 
+#[derive(Parser)]
+struct KeychainExportCertificateChain {
+    /// Keychain domain to operate on
+    #[arg(long, value_parser = KEYCHAIN_DOMAINS, default_value = "user")]
+    domain: String,
+
+    /// Password to unlock the Keychain
+    #[arg(long, group = "unlock-password")]
+    password: Option<String>,
+
+    /// File containing password to use to unlock the Keychain
+    #[arg(long, group = "unlock-password")]
+    password_file: Option<PathBuf>,
+
+    /// Print only the issuing certificate chain, not the subject certificate
+    #[arg(long)]
+    no_print_self: bool,
+
+    /// User ID value of code signing certificate to find and whose CA chain to export
+    #[arg(long)]
+    user_id: String,
+}
+
 #[cfg(target_os = "macos")]
-fn command_keychain_export_certificate_chain(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let user_id = args.get_one::<String>("user_id").unwrap();
-
-    let domain = args
-        .get_one::<String>("domain")
-        .expect("clap should have added default value");
-
-    let domain = KeychainDomain::try_from(domain.as_str())
+fn command_keychain_export_certificate_chain(
+    args: &KeychainExportCertificateChain,
+) -> Result<(), AppleCodesignError> {
+    let domain = KeychainDomain::try_from(args.domain.as_str())
         .expect("clap should have validated domain values");
 
-    let password = if let Some(path) = args.get_one::<String>("password_file") {
+    let password = if let Some(path) = &args.password_file {
         let data = std::fs::read_to_string(path)?;
 
         Some(
@@ -1790,16 +1819,16 @@ fn command_keychain_export_certificate_chain(args: &ArgMatches) -> Result<(), Ap
                 .expect("should get a single line")
                 .to_string(),
         )
-    } else if let Some(password) = args.get_one::<String>("password") {
+    } else if let Some(password) = &args.password {
         Some(password.to_string())
     } else {
         None
     };
 
-    let certs = macos_keychain_find_certificate_chain(domain, password.as_deref(), user_id)?;
+    let certs = macos_keychain_find_certificate_chain(domain, password.as_deref(), &args.user_id)?;
 
     for (i, cert) in certs.iter().enumerate() {
-        if args.get_flag("no_print_self") && i == 0 {
+        if args.no_print_self && i == 0 {
             continue;
         }
 
@@ -1810,19 +1839,26 @@ fn command_keychain_export_certificate_chain(args: &ArgMatches) -> Result<(), Ap
 }
 
 #[cfg(not(target_os = "macos"))]
-fn command_keychain_export_certificate_chain(_args: &ArgMatches) -> Result<(), AppleCodesignError> {
+fn command_keychain_export_certificate_chain(
+    _args: &KeychainExportCertificateChain,
+) -> Result<(), AppleCodesignError> {
     Err(AppleCodesignError::CliGeneralError(
         "macOS Keychain export only supported on macOS".to_string(),
     ))
 }
 
-#[cfg(target_os = "macos")]
-fn command_keychain_print_certificates(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let domain = args
-        .get_one::<String>("domain")
-        .expect("clap should have added default value");
+#[derive(Parser)]
+struct KeychainPrintCertificates {
+    /// Keychain domain to operate on
+    #[arg(long, value_parser = KEYCHAIN_DOMAINS, default_value = "user")]
+    domain: String,
+}
 
-    let domain = KeychainDomain::try_from(domain.as_str())
+#[cfg(target_os = "macos")]
+fn command_keychain_print_certificates(
+    args: &KeychainPrintCertificates,
+) -> Result<(), AppleCodesignError> {
+    let domain = KeychainDomain::try_from(args.domain.as_str())
         .expect("clap should have validated domain values");
 
     let certs = keychain_find_code_signing_certificates(domain, None)?;
@@ -1838,12 +1874,15 @@ fn command_keychain_print_certificates(args: &ArgMatches) -> Result<(), AppleCod
 }
 
 #[cfg(not(target_os = "macos"))]
-fn command_keychain_print_certificates(_args: &ArgMatches) -> Result<(), AppleCodesignError> {
+fn command_keychain_print_certificates(
+    _args: &KeychainPrintCertificates,
+) -> Result<(), AppleCodesignError> {
     Err(AppleCodesignError::CliGeneralError(
         "macOS Keychain integration supported on macOS".to_string(),
     ))
 }
 
+#[cfg(feature = "notarize")]
 const NOTARIZE_ABOUT: &str = "\
 Submit a notarization request to Apple.
 
@@ -1893,38 +1932,21 @@ To automatically staple an asset after server-side processing has finished,
 specify `--staple`. This implies `--wait`.
 ";
 
-/// Obtain a notarization client from arguments.
-fn notarizer_from_args(args: &ArgMatches) -> Result<Notarizer, AppleCodesignError> {
-    let api_key_path = args.get_one::<PathBuf>("api_key_path");
-    let api_issuer = args.get_one::<String>("api_issuer");
-    let api_key = args.get_one::<String>("api_key");
+#[cfg(feature = "notarize")]
+#[derive(Parser)]
+struct NotaryLog {
+    /// The ID of the previous submission to wait on
+    submission_id: String,
 
-    if let Some(api_key_path) = api_key_path {
-        Notarizer::from_api_key(api_key_path)
-    } else if let (Some(issuer), Some(key)) = (api_issuer, api_key) {
-        Notarizer::from_api_key_id(issuer, key)
-    } else {
-        Err(AppleCodesignError::NotarizeNoAuthCredentials)
-    }
+    #[command(flatten)]
+    api: NotaryApi,
 }
 
-fn notarizer_wait_duration(args: &ArgMatches) -> Result<std::time::Duration, AppleCodesignError> {
-    let max_wait_seconds = args
-        .get_one::<String>("max_wait_seconds")
-        .expect("argument should have default value");
-    let max_wait_seconds =
-        u64::from_str(max_wait_seconds).map_err(|_| AppleCodesignError::CliBadArgument)?;
+#[cfg(feature = "notarize")]
+fn command_notary_log(args: &NotaryLog) -> Result<(), AppleCodesignError> {
+    let notarizer = args.api.notarizer()?;
 
-    Ok(std::time::Duration::from_secs(max_wait_seconds))
-}
-
-fn command_notary_log(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let notarizer = notarizer_from_args(args)?;
-    let submission_id = args
-        .get_one::<String>("submission_id")
-        .expect("submission_id is required");
-
-    let log = notarizer.fetch_notarization_log(submission_id)?;
+    let log = notarizer.fetch_notarization_log(&args.submission_id)?;
 
     for line in serde_json::to_string_pretty(&log)?.lines() {
         println!("{line}");
@@ -1933,24 +1955,42 @@ fn command_notary_log(args: &ArgMatches) -> Result<(), AppleCodesignError> {
     Ok(())
 }
 
-fn command_notary_submit(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let path = PathBuf::from(
-        args.get_one::<String>("path")
-            .expect("clap should have validated arguments"),
-    );
-    let staple = args.get_flag("staple");
-    let wait = args.get_flag("wait") || staple;
+#[cfg(feature = "notarize")]
+#[derive(Parser)]
+struct NotarySubmit {
+    /// Whether to wait for upload processing to complete
+    #[arg(long)]
+    wait: bool,
+
+    /// Maximum time in seconds to wait for the upload result
+    #[arg(long, default_value = "600")]
+    max_wait_seconds: u64,
+
+    /// Staple the notarization ticket after successful upload (implies --wait)
+    #[arg(long)]
+    staple: bool,
+
+    /// Path to asset to upload
+    path: PathBuf,
+
+    #[command(flatten)]
+    api: NotaryApi,
+}
+
+#[cfg(feature = "notarize")]
+fn command_notary_submit(args: &NotarySubmit) -> Result<(), AppleCodesignError> {
+    let wait = args.wait || args.staple;
 
     let wait_limit = if wait {
-        Some(notarizer_wait_duration(args)?)
+        Some(std::time::Duration::from_secs(args.max_wait_seconds))
     } else {
         None
     };
-    let notarizer = notarizer_from_args(args)?;
+    let notarizer = args.api.notarizer()?;
 
-    let upload = notarizer.notarize_path(&path, wait_limit)?;
+    let upload = notarizer.notarize_path(&args.path, wait_limit)?;
 
-    if staple {
+    if args.staple {
         match upload {
             crate::notarization::NotarizationUpload::UploadId(_) => {
                 panic!(
@@ -1959,7 +1999,7 @@ fn command_notary_submit(args: &ArgMatches) -> Result<(), AppleCodesignError> {
             }
             crate::notarization::NotarizationUpload::NotaryResponse(_) => {
                 let stapler = crate::stapling::Stapler::new()?;
-                stapler.staple_path(&path)?;
+                stapler.staple_path(&args.path)?;
             }
         }
     }
@@ -1967,33 +2007,49 @@ fn command_notary_submit(args: &ArgMatches) -> Result<(), AppleCodesignError> {
     Ok(())
 }
 
-fn command_notary_wait(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let wait_duration = notarizer_wait_duration(args)?;
-    let notarizer = notarizer_from_args(args)?;
-    let submission_id = args
-        .get_one::<String>("submission_id")
-        .expect("submission_id is required");
+#[cfg(feature = "notarize")]
+#[derive(Parser)]
+struct NotaryWait {
+    /// Maximum time in seconds to wait for the upload result
+    #[arg(long, default_value = "600")]
+    max_wait_seconds: u64,
 
-    notarizer.wait_on_notarization_and_fetch_log(submission_id, wait_duration)?;
+    /// The ID of the previous submission to wait on
+    submission_id: String,
+
+    #[command(flatten)]
+    api: NotaryApi,
+}
+
+#[cfg(feature = "notarize")]
+fn command_notary_wait(args: &NotaryWait) -> Result<(), AppleCodesignError> {
+    let wait_duration = std::time::Duration::from_secs(args.max_wait_seconds);
+    let notarizer = args.api.notarizer()?;
+
+    notarizer.wait_on_notarization_and_fetch_log(&args.submission_id, wait_duration)?;
 
     Ok(())
 }
 
-fn command_parse_code_signing_requirement(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let path = args
-        .get_one::<String>("input_path")
-        .expect("clap should have validated argument");
+#[derive(Parser)]
+struct ParseCodeSigningRequirement {
+    /// Output format
+    #[arg(long, value_parser = ["csrl", "expression-tree"], default_value = "csrl")]
+    format: String,
 
-    let data = std::fs::read(path)?;
+    /// Path to file to parse
+    input_path: PathBuf,
+}
+
+fn command_parse_code_signing_requirement(
+    args: &ParseCodeSigningRequirement,
+) -> Result<(), AppleCodesignError> {
+    let data = std::fs::read(&args.input_path)?;
 
     let requirements = CodeRequirements::parse_blob(&data)?.0;
 
     for requirement in requirements.iter() {
-        match args
-            .get_one::<String>("format")
-            .expect("clap should have validated argument")
-            .as_str()
-        {
+        match args.format.as_str() {
             "csrl" => {
                 println!("{requirement}");
             }
@@ -2007,12 +2063,14 @@ fn command_parse_code_signing_requirement(args: &ArgMatches) -> Result<(), Apple
     Ok(())
 }
 
-fn command_print_signature_info(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let path = args
-        .get_one::<String>("path")
-        .expect("clap should have validated argument");
+#[derive(Parser)]
+struct PrintSignatureInfo {
+    /// Filesystem path to entity whose info to print
+    path: PathBuf,
+}
 
-    let reader = SignatureReader::from_path(path)?;
+fn command_print_signature_info(args: &PrintSignatureInfo) -> Result<(), AppleCodesignError> {
+    let reader = SignatureReader::from_path(&args.path)?;
 
     let entities = reader.entities()?;
     serde_yaml::to_writer(std::io::stdout(), &entities)?;
@@ -2020,12 +2078,32 @@ fn command_print_signature_info(args: &ArgMatches) -> Result<(), AppleCodesignEr
     Ok(())
 }
 
-fn command_remote_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let remote_url = args
-        .get_one::<String>("remote_signing_url")
-        .expect("remote signing URL should always be present");
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct SessionJoinString {
+    /// Open an editor to input the session join string
+    #[arg(long = "editor")]
+    session_join_string_editor: bool,
 
-    let session_join_string = if args.get_flag("session_join_string_editor") {
+    /// Path to file containing session join string
+    #[arg(long = "sjs-path")]
+    session_join_string_path: Option<String>,
+
+    /// Session join string (provided by the signing initiator)
+    session_join_string: Option<String>,
+}
+
+#[derive(Parser)]
+struct RemoteSign {
+    #[command(flatten)]
+    session_join_string: SessionJoinString,
+
+    #[command(flatten)]
+    certificate: CertificateSource,
+}
+
+fn command_remote_sign(args: &RemoteSign) -> Result<(), AppleCodesignError> {
+    let session_join_string = if args.session_join_string.session_join_string_editor {
         let mut value = None;
 
         for _ in 0..3 {
@@ -2041,9 +2119,9 @@ fn command_remote_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
         value.ok_or_else(|| {
             AppleCodesignError::CliGeneralError("session join string not entered in editor".into())
         })?
-    } else if let Some(path) = args.get_one::<String>("session_join_string_path") {
+    } else if let Some(path) = &args.session_join_string.session_join_string_path {
         std::fs::read_to_string(path)?
-    } else if let Some(value) = args.get_one::<String>("session_join_string") {
+    } else if let Some(value) = &args.session_join_string.session_join_string {
         value.to_string()
     } else {
         return Err(AppleCodesignError::CliGeneralError(
@@ -2053,14 +2131,14 @@ fn command_remote_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
 
     let mut joiner = create_session_joiner(session_join_string)?;
 
-    if let Some(env) = args.get_one::<String>("remote_shared_secret_env") {
+    if let Some(env) = &args.certificate.remote_shared_secret_env {
         let secret = std::env::var(env).map_err(|_| AppleCodesignError::CliBadArgument)?;
         joiner.register_state(SessionJoinState::SharedSecret(secret.as_bytes().to_vec()))?;
-    } else if let Some(secret) = args.get_one::<String>("remote_shared_secret") {
+    } else if let Some(secret) = &args.certificate.remote_shared_secret {
         joiner.register_state(SessionJoinState::SharedSecret(secret.as_bytes().to_vec()))?;
     }
 
-    let (private_keys, mut public_certificates) = collect_certificates_from_args(args, true)?;
+    let (private_keys, mut public_certificates) = args.certificate.resolve_certificates(true)?;
 
     let private = private_keys
         .into_iter()
@@ -2085,17 +2163,81 @@ fn command_remote_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
         private.as_key_info_signer(),
         cert,
         certificates,
-        remote_url.to_string(),
+        args.certificate.remote_signing_url.clone(),
     )?;
     client.run()?;
 
     Ok(())
 }
 
-fn command_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
+#[derive(Parser)]
+struct Sign {
+    /// Identifier string for binary. The value normally used by CFBundleIdentifier
+    #[arg(long)]
+    binary_identifier: Vec<String>,
+
+    /// Path to a file containing binary code requirements data to be used as designated requirements
+    #[arg(long)]
+    code_requirements_path: Vec<String>,
+
+    /// Path to an XML plist file containing code resources
+    #[arg(long)]
+    code_resources: Vec<String>,
+
+    /// Code signature flags to set
+    #[arg(long, value_parser = CodeSignatureFlags::all_user_configurable())]
+    code_signature_flags: Vec<String>,
+
+    /// Digest algorithm to use
+    #[arg(long, value_parser = SUPPORTED_HASHES)]
+    digest: Option<String>,
+
+    /// Extra digests to include in signatures
+    #[arg(long, value_parser = SUPPORTED_HASHES)]
+    extra_digest: Vec<String>,
+
+    /// Path to a plist file containing entitlements
+    #[arg(short = 'e', long)]
+    entitlements_xml_path: Vec<String>,
+
+    /// Hardened runtime version to use (defaults to SDK version used to build binary)
+    #[arg(long)]
+    runtime_version: Vec<String>,
+
+    /// Include specified files as regular files during signing using regex matching rules
+    #[arg(long)]
+    include_as_regular_files: Vec<String>,
+
+    /// Path to an Info.plist file whose digest to include in Mach-O signature
+    #[arg(long)]
+    info_plist_path: Vec<String>,
+
+    /// Team name/identifier to include in code signature
+    #[arg(long)]
+    team_name: Option<String>,
+
+    /// URL of timestamp server to use to obtain a token of the CMS signature
+    #[arg(long, default_value = APPLE_TIMESTAMP_URL)]
+    timestamp_url: String,
+
+    /// Glob expression of paths to exclude from signing
+    #[arg(long)]
+    exclude: Vec<String>,
+
+    /// Path to Mach-O binary to sign
+    input_path: PathBuf,
+
+    /// Path to signed Mach-O binary to write
+    output_path: Option<PathBuf>,
+
+    #[command(flatten)]
+    certificate: CertificateSource,
+}
+
+fn command_sign(args: &Sign) -> Result<(), AppleCodesignError> {
     let mut settings = SigningSettings::default();
 
-    let (private_keys, mut public_certificates) = collect_certificates_from_args(args, true)?;
+    let (private_keys, mut public_certificates) = args.certificate.resolve_certificates(true)?;
 
     if private_keys.len() > 1 {
         error!("at most 1 PRIVATE KEY can be present; aborting");
@@ -2128,11 +2270,9 @@ fn command_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
             }
         }
 
-        if let Some(timestamp_url) = args.get_one::<String>("timestamp_url") {
-            if timestamp_url != "none" {
-                warn!("using time-stamp protocol server {}", timestamp_url);
-                settings.set_time_stamp_url(timestamp_url)?;
-            }
+        if args.timestamp_url != "none" {
+            warn!("using time-stamp protocol server {}", args.timestamp_url);
+            settings.set_time_stamp_url(&args.timestamp_url)?;
         }
     }
 
@@ -2148,125 +2288,103 @@ fn command_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
         settings.chain_certificate(cert);
     }
 
-    if let Some(team_name) = args.get_one::<String>("team_name") {
+    if let Some(team_name) = &args.team_name {
         settings.set_team_id(team_name);
     }
 
-    if let Some(value) = args.get_one::<String>("digest") {
+    if let Some(value) = &args.digest {
         let digest_type = DigestType::try_from(value.as_str())?;
         settings.set_digest_type(digest_type);
     }
 
-    if let Some(values) = args.get_many::<String>("extra_digest") {
-        for value in values {
-            let (scope, digest_type) = parse_scoped_value(value)?;
-            let digest_type = DigestType::try_from(digest_type)?;
-            settings.add_extra_digest(scope, digest_type);
-        }
+    for value in &args.extra_digest {
+        let (scope, digest_type) = parse_scoped_value(value)?;
+        let digest_type = DigestType::try_from(digest_type)?;
+        settings.add_extra_digest(scope, digest_type);
     }
 
-    if let Some(values) = args.get_many::<String>("exclude") {
-        for pattern in values {
-            settings.add_path_exclusion(pattern)?;
-        }
+    for pattern in &args.exclude {
+        settings.add_path_exclusion(pattern)?;
     }
 
-    if let Some(values) = args.get_many::<String>("binary_identifier") {
-        for value in values {
-            let (scope, identifier) = parse_scoped_value(value)?;
-            settings.set_binary_identifier(scope, identifier);
-        }
+    for value in &args.binary_identifier {
+        let (scope, identifier) = parse_scoped_value(value)?;
+        settings.set_binary_identifier(scope, identifier);
     }
 
-    if let Some(values) = args.get_many::<String>("code_requirements_path") {
-        for value in values {
-            let (scope, path) = parse_scoped_value(value)?;
+    for value in &args.code_requirements_path {
+        let (scope, path) = parse_scoped_value(value)?;
 
-            let code_requirements_data = std::fs::read(path)?;
-            let reqs = CodeRequirements::parse_blob(&code_requirements_data)?.0;
-            for expr in reqs.iter() {
-                warn!(
-                    "setting designated code requirements for {}: {}",
-                    scope, expr
-                );
-                settings.set_designated_requirement_expression(scope.clone(), expr)?;
-            }
-        }
-    }
-
-    if let Some(values) = args.get_many::<String>("code_resources") {
-        for value in values {
-            let (scope, path) = parse_scoped_value(value)?;
-
+        let code_requirements_data = std::fs::read(path)?;
+        let reqs = CodeRequirements::parse_blob(&code_requirements_data)?.0;
+        for expr in reqs.iter() {
             warn!(
-                "setting code resources data for {} from path {}",
-                scope, path
+                "setting designated code requirements for {}: {}",
+                scope, expr
             );
-            let code_resources_data = std::fs::read(path)?;
-            settings.set_code_resources_data(scope, code_resources_data);
+            settings.set_designated_requirement_expression(scope.clone(), expr)?;
         }
     }
 
-    if let Some(values) = args.get_many::<String>("code_signature_flags_set") {
-        for value in values {
-            let (scope, value) = parse_scoped_value(value)?;
+    for value in &args.code_resources {
+        let (scope, path) = parse_scoped_value(value)?;
 
-            let flags = CodeSignatureFlags::from_str(value)?;
-            settings.set_code_signature_flags(scope, flags);
-        }
+        warn!(
+            "setting code resources data for {} from path {}",
+            scope, path
+        );
+        let code_resources_data = std::fs::read(path)?;
+        settings.set_code_resources_data(scope, code_resources_data);
     }
 
-    if let Some(values) = args.get_many::<String>("entitlements_xml_path") {
-        for value in values {
-            let (scope, path) = parse_scoped_value(value)?;
+    for value in &args.code_signature_flags {
+        let (scope, value) = parse_scoped_value(value)?;
 
-            warn!("setting entitlments XML for {} from path {}", scope, path);
-            let entitlements_data = std::fs::read_to_string(path)?;
-            settings.set_entitlements_xml(scope, entitlements_data)?;
-        }
+        let flags = CodeSignatureFlags::from_str(value)?;
+        settings.set_code_signature_flags(scope, flags);
     }
 
-    if let Some(values) = args.get_many::<String>("runtime_version") {
-        for value in values {
-            let (scope, value) = parse_scoped_value(value)?;
+    for value in &args.entitlements_xml_path {
+        let (scope, path) = parse_scoped_value(value)?;
 
-            let version = semver::Version::parse(value)?;
-            settings.set_runtime_version(scope, version);
-        }
+        warn!("setting entitlments XML for {} from path {}", scope, path);
+        let entitlements_data = std::fs::read_to_string(path)?;
+        settings.set_entitlements_xml(scope, entitlements_data)?;
     }
 
-    if let Some(values) = args.get_many::<String>("include_as_regular_files") {
-        for value in values {
-            let (_scope, value) = parse_scoped_value(value)?;
+    for value in &args.runtime_version {
+        let (scope, value) = parse_scoped_value(value)?;
 
-            let rule = CodeResourcesRule::new(value)?.weight(21);
-            settings.add_regular_file_rule(rule);
-        }
+        let version = semver::Version::parse(value)?;
+        settings.set_runtime_version(scope, version);
     }
 
-    if let Some(values) = args.get_many::<String>("info_plist_path") {
-        for value in values {
-            let (scope, value) = parse_scoped_value(value)?;
+    for value in &args.include_as_regular_files {
+        let (_scope, value) = parse_scoped_value(value)?;
 
-            let content = std::fs::read(value)?;
-            settings.set_info_plist_data(scope, content);
-        }
+        let rule = CodeResourcesRule::new(value)?.weight(21);
+        settings.add_regular_file_rule(rule);
     }
 
-    let input_path = PathBuf::from(
-        args.get_one::<String>("input_path")
-            .expect("input_path presence should have been validated by clap"),
-    );
-    let output_path = args.get_one::<String>("output_path");
+    for value in &args.info_plist_path {
+        let (scope, value) = parse_scoped_value(value)?;
+
+        let content = std::fs::read(value)?;
+        settings.set_info_plist_data(scope, content);
+    }
 
     let signer = UnifiedSigner::new(settings);
 
-    if let Some(output_path) = output_path {
-        warn!("signing {} to {}", input_path.display(), output_path);
-        signer.sign_path(input_path, output_path)?;
+    if let Some(output_path) = &args.output_path {
+        warn!(
+            "signing {} to {}",
+            args.input_path.display(),
+            output_path.display()
+        );
+        signer.sign_path(&args.input_path, output_path)?;
     } else {
-        warn!("signing {} in place", input_path.display());
-        signer.sign_path_in_place(input_path)?;
+        warn!("signing {} in place", args.input_path.display());
+        signer.sign_path_in_place(&args.input_path)?;
     }
 
     if let Some(private) = &private {
@@ -2277,7 +2395,7 @@ fn command_sign(args: &ArgMatches) -> Result<(), AppleCodesignError> {
 }
 
 #[cfg(feature = "yubikey")]
-fn command_smartcard_scan(_args: &ArgMatches) -> Result<(), AppleCodesignError> {
+fn command_smartcard_scan() -> Result<(), AppleCodesignError> {
     let mut ctx = ::yubikey::reader::Context::open()?;
     for (index, reader) in ctx.iter()?.enumerate() {
         println!("Device {}: {}", index, reader.name());
@@ -2304,29 +2422,28 @@ fn command_smartcard_scan(_args: &ArgMatches) -> Result<(), AppleCodesignError> 
 }
 
 #[cfg(not(feature = "yubikey"))]
-fn command_smartcard_scan(_args: &ArgMatches) -> Result<(), AppleCodesignError> {
+fn command_smartcard_scan() -> Result<(), AppleCodesignError> {
     eprintln!("smartcard reading requires the `yubikey` crate feature, which isn't enabled.");
     eprintln!("recompile the crate with `cargo build --features yubikey` to enable support");
     std::process::exit(1);
 }
 
-#[cfg(feature = "yubikey")]
-fn command_smartcard_generate_key(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let slot_id = ::yubikey::piv::SlotId::from_str(
-        args.get_one::<String>("smartcard_slot").ok_or_else(|| {
-            error!("--smartcard-slot is required");
-            AppleCodesignError::CliBadArgument
-        })?,
-    )?;
+#[derive(Parser)]
+struct SmartcardGenerateKey {
+    /// Smartcard slot number to store key in (9c is common)
+    #[arg(long)]
+    smartcard_slot: String,
 
-    let touch_policy = str_to_touch_policy(
-        args.get_one::<String>("touch_policy")
-            .expect("touch_policy argument is required"),
-    )?;
-    let pin_policy = str_to_pin_policy(
-        args.get_one::<String>("pin_policy")
-            .expect("pin_policy argument is required"),
-    )?;
+    #[command(flatten)]
+    policy: YubikeyPolicy,
+}
+
+#[cfg(feature = "yubikey")]
+fn command_smartcard_generate_key(args: &SmartcardGenerateKey) -> Result<(), AppleCodesignError> {
+    let slot_id = ::yubikey::piv::SlotId::from_str(&args.smartcard_slot)?;
+
+    let touch_policy = str_to_touch_policy(args.policy.touch_policy.as_str())?;
+    let pin_policy = str_to_pin_policy(args.policy.pin_policy.as_str())?;
 
     let mut yk = YubiKey::new()?;
     yk.set_pin_callback(prompt_smartcard_pin);
@@ -2337,31 +2454,41 @@ fn command_smartcard_generate_key(args: &ArgMatches) -> Result<(), AppleCodesign
 }
 
 #[cfg(not(feature = "yubikey"))]
-fn command_smartcard_generate_key(_args: &ArgMatches) -> Result<(), AppleCodesignError> {
+fn command_smartcard_generate_key(_args: &SmartcardGenerateKey) -> Result<(), AppleCodesignError> {
     eprintln!("smartcard integration requires the `yubikey` crate feature, which isn't enabled.");
     eprintln!("recompile the crate with `cargo build --features yubikey` to enable support");
     std::process::exit(1);
 }
 
+#[derive(Parser)]
+struct SmartcardImport {
+    /// Re-use the existing private key in the smartcard slot
+    #[arg(long)]
+    existing_key: bool,
+
+    /// Don't actually perform the import
+    #[arg(long)]
+    dry_run: bool,
+
+    #[command(flatten)]
+    certificate: CertificateSource,
+
+    #[command(flatten)]
+    policy: YubikeyPolicy,
+}
+
 #[cfg(feature = "yubikey")]
-fn command_smartcard_import(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let (keys, certs) = collect_certificates_from_args(args, false)?;
+fn command_smartcard_import(args: &SmartcardImport) -> Result<(), AppleCodesignError> {
+    let (keys, certs) = args.certificate.resolve_certificates(false)?;
 
     let slot_id = ::yubikey::piv::SlotId::from_str(
-        args.get_one::<String>("smartcard_slot").ok_or_else(|| {
+        args.certificate.smartcard_slot.as_ref().ok_or_else(|| {
             error!("--smartcard-slot is required");
             AppleCodesignError::CliBadArgument
         })?,
     )?;
-    let touch_policy = str_to_touch_policy(
-        args.get_one::<String>("touch_policy")
-            .expect("touch_policy argument is required"),
-    )?;
-    let pin_policy = str_to_pin_policy(
-        args.get_one::<String>("pin_policy")
-            .expect("pin_policy argument is required"),
-    )?;
-    let use_existing_key = args.get_flag("existing_key");
+    let touch_policy = str_to_touch_policy(args.policy.touch_policy.as_str())?;
+    let pin_policy = str_to_pin_policy(args.policy.pin_policy.as_str())?;
 
     println!(
         "found {} private keys and {} public certificates",
@@ -2369,7 +2496,7 @@ fn command_smartcard_import(args: &ArgMatches) -> Result<(), AppleCodesignError>
         certs.len()
     );
 
-    let key = if use_existing_key {
+    let key = if args.existing_key {
         println!("using existing private key in smartcard");
 
         if !keys.is_empty() {
@@ -2401,7 +2528,7 @@ fn command_smartcard_import(args: &ArgMatches) -> Result<(), AppleCodesignError>
     let mut yk = YubiKey::new()?;
     yk.set_pin_callback(prompt_smartcard_pin);
 
-    if args.get_flag("dry_run") {
+    if args.dry_run {
         println!("dry run mode enabled; stopping");
         return Ok(());
     }
@@ -2422,29 +2549,33 @@ fn command_smartcard_import(args: &ArgMatches) -> Result<(), AppleCodesignError>
 }
 
 #[cfg(not(feature = "yubikey"))]
-fn command_smartcard_import(_args: &ArgMatches) -> Result<(), AppleCodesignError> {
+fn command_smartcard_import(_args: &SmartcardImport) -> Result<(), AppleCodesignError> {
     eprintln!("smartcard import requires `yubikey` crate feature, which isn't enabled.");
     eprintln!("recompile the crate with `cargo build --features yubikey` to enable support");
     std::process::exit(1);
 }
 
-fn command_staple(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let path = args
-        .get_one::<String>("path")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
+#[derive(Parser)]
+struct Staple {
+    /// Path to entity to attempt to staple
+    path: PathBuf,
+}
 
+fn command_staple(args: &Staple) -> Result<(), AppleCodesignError> {
     let stapler = crate::stapling::Stapler::new()?;
-    stapler.staple_path(path)?;
+    stapler.staple_path(&args.path)?;
 
     Ok(())
 }
 
-fn command_verify(args: &ArgMatches) -> Result<(), AppleCodesignError> {
-    let path = args
-        .get_one::<String>("path")
-        .ok_or(AppleCodesignError::CliBadArgument)?;
+#[derive(Parser)]
+struct Verify {
+    /// Path of Mach-O binary to examine
+    path: PathBuf,
+}
 
-    let data = std::fs::read(path)?;
+fn command_verify(args: &Verify) -> Result<(), AppleCodesignError> {
+    let data = std::fs::read(&args.path)?;
 
     let problems = crate::verify::verify_macho_data(data);
 
@@ -2461,7 +2592,7 @@ fn command_verify(args: &ArgMatches) -> Result<(), AppleCodesignError> {
     }
 }
 
-fn command_x509_oids(_args: &ArgMatches) -> Result<(), AppleCodesignError> {
+fn command_x509_oids() -> Result<(), AppleCodesignError> {
     println!("# Extended Key Usage (EKU) Extension OIDs");
     println!();
     for ekup in crate::certificate::ExtendedKeyUsagePurpose::all() {
@@ -2483,581 +2614,110 @@ fn command_x509_oids(_args: &ArgMatches) -> Result<(), AppleCodesignError> {
     Ok(())
 }
 
+#[derive(Parser)]
+enum Subcommands {
+    /// Analyze an X.509 certificate for Apple code signing properties.
+    ///
+    /// Given the path to a PEM encoded X.509 certificate, this command will read
+    /// the certificate and print information about it relevant to Apple code
+    /// signing.
+    ///
+    /// The output of the command can be useful to learn about X.509 certificate
+    /// extensions used by code signing certificates and to debug low-level
+    /// properties related to certificates.
+    AnalyzeCertificate(AnalyzeCertificate),
+
+    /// Compute code hashes for a binary
+    ComputeCodeHashes(ComputeCodeHashes),
+
+    /// Print a diff between the signature content of two paths
+    DiffSignatures(DiffSignatures),
+
+    /// Encode App Store Connect API Key metadata to a single file
+    #[cfg(feature = "notarize")]
+    #[command(long_about = ENCODE_APP_STORE_CONNECT_API_KEY_ABOUT)]
+    EncodeAppStoreConnectApiKey(EncodeAppStoreConnectApiKey),
+
+    /// Extracts code signature data from a Mach-O binary
+    #[command(long_about = EXTRACT_ABOUT)]
+    Extract(Extract),
+
+    /// Generates a certificate signing request that can be sent to Apple and exchanged for a signing certificate
+    GenerateCertificateSigningRequest(GenerateCertificateSigningRequest),
+
+    /// Generate a self-signed certificate for code signing
+    #[command(long_about = GENERATE_SELF_SIGNED_CERTIFICATE_ABOUT)]
+    GenerateSelfSignedCertificate(GenerateSelfSignedCertificate),
+
+    /// Export Apple CA certificates from the macOS Keychain
+    KeychainExportCertificateChain(KeychainExportCertificateChain),
+
+    /// Print information about certificates in the macOS keychain
+    KeychainPrintCertificates(KeychainPrintCertificates),
+
+    #[cfg(feature = "notarize")]
+    /// Fetch the notarization log for a previous submission
+    NotaryLog(NotaryLog),
+
+    /// Upload an asset to Apple for notarization and possibly staple it
+    #[cfg(feature = "notarize")]
+    #[command(long_about = NOTARIZE_ABOUT, alias = "notarize")]
+    NotarySubmit(NotarySubmit),
+
+    /// Wait for completion of a previous submission
+    #[cfg(feature = "notarize")]
+    NotaryWait(NotaryWait),
+
+    /// Parse binary Code Signing Requirement data into a human readable string
+    #[command(long_about = PARSE_CODE_SIGNING_REQUIREMENT_ABOUT)]
+    ParseCodeSigningRequirement(ParseCodeSigningRequirement),
+
+    /// Print signature information for a filesystem path
+    PrintSignatureInfo(PrintSignatureInfo),
+
+    /// Show information about available smartcard (SC) devices
+    SmartcardScan,
+
+    /// Generate a new private key on a smartcard
+    SmartcardGenerateKey(SmartcardGenerateKey),
+
+    /// Import a code signing certificate and key into a smartcard
+    SmartcardImport(SmartcardImport),
+
+    /// Create signatures initiated from a remote signing operation
+    RemoteSign(RemoteSign),
+
+    /// Sign a Mach-O binary or bundle
+    #[command(long_about = SIGN_ABOUT)]
+    Sign(Sign),
+
+    /// Staples a notarization ticket to an entity
+    Staple(Staple),
+
+    /// Verifies code signature data
+    Verify(Verify),
+
+    /// Print information about X.509 OIDs related to Apple code signing
+    X509Oids,
+}
+
+/// Sign and notarize Apple programs. See https://gregoryszorc.com/docs/apple-codesign/main/ for more docs
+#[derive(Parser)]
+#[command(author, version, arg_required_else_help = true)]
+struct Cli {
+    /// Increase logging verbosity. Can be specified multiple times
+    #[arg(short = 'v', long, global = true, action = ArgAction::Count)]
+    verbose: u8,
+
+    #[command(subcommand)]
+    command: Subcommands,
+}
+
 pub fn main_impl() -> Result<(), AppleCodesignError> {
-    let app = Command::new("Cross platform Apple code signing in pure Rust")
-        .version(env!("CARGO_PKG_VERSION"))
-        .author("Gregory Szorc <gregory.szorc@gmail.com>")
-        .about("Sign and notarize Apple programs. See https://gregoryszorc.com/docs/apple-codesign/main/ for more docs.")
-        .arg_required_else_help(true)
-        .arg(
-            Arg::new("verbose")
-                .long("verbose")
-                .short('v')
-                .global(true)
-                .action(ArgAction::Count)
-                .help("Increase logging verbosity. Can be specified multiple times."),
-        );
-
-    let app = app.subcommand(add_certificate_source_args(
-        Command::new("analyze-certificate")
-            .about("Analyze an X.509 certificate for Apple code signing properties")
-            .long_about(ANALYZE_CERTIFICATE_ABOUT),
-    ));
-
-    let app = app.subcommand(
-        Command::new("compute-code-hashes")
-            .about("Compute code hashes for a binary")
-            .arg(
-                Arg::new("path")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("path to Mach-O binary to examine"),
-            )
-            .arg(
-                Arg::new("hash")
-                    .long("hash")
-                    .action(ArgAction::Set)
-                    .value_parser(SUPPORTED_HASHES)
-                    .default_value("sha256")
-                    .help("Hashing algorithm to use"),
-            )
-            .arg(
-                Arg::new("page_size")
-                    .long("page-size")
-                    .action(ArgAction::Set)
-                    .default_value("4096")
-                    .help("Chunk size to digest over"),
-            )
-            .arg(
-                Arg::new("universal_index")
-                    .long("universal-index")
-                    .action(ArgAction::Set)
-                    .default_value("0")
-                    .help("Index of Mach-O binary to operate on within a universal/fat binary"),
-            ),
-    );
-
-    let app = app.subcommand(
-        Command::new("diff-signatures")
-            .about("Print a diff between the signature content of two paths")
-            .arg(
-                Arg::new("path0")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("The first path to compare"),
-            )
-            .arg(
-                Arg::new("path1")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("The second path to compare"),
-            ),
-    );
-
-    let app = app.subcommand(
-        Command::new("encode-app-store-connect-api-key")
-            .about("Encode App Store Connect API Key metadata to a single file")
-            .long_about(ENCODE_APP_STORE_CONNECT_API_KEY_ABOUT)
-            .arg(
-                Arg::new("output_path")
-                    .short('o')
-                    .long("output-path")
-                    .action(ArgAction::Set)
-                    .value_parser(value_parser!(PathBuf))
-                    .help("Path to a JSON file to create the output to"),
-            )
-            .arg(
-                Arg::new("issuer_id")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("The issuer of the API Token. Likely a UUID"),
-            )
-            .arg(
-                Arg::new("key_id")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("The Key ID. A short alphanumeric string like DEADBEEF42"),
-            )
-            .arg(
-                Arg::new("private_key_path")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .value_parser(value_parser!(PathBuf))
-                    .help("Path to a file containing the private key downloaded from Apple"),
-            ),
-    );
-
-    let app = app.subcommand(
-        Command::new("extract")
-            .about("Extracts code signature data from a Mach-O binary")
-            .long_about(EXTRACT_ABOUT)
-            .arg(
-                Arg::new("path")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("Path to Mach-O binary to examine"),
-            )
-            .arg(
-                Arg::new("data")
-                    .long("data")
-                    .action(ArgAction::Set)
-                    .value_parser([
-                        "blobs",
-                        "cms-info",
-                        "cms-pem",
-                        "cms-raw",
-                        "cms",
-                        "code-directory-raw",
-                        "code-directory-serialized-raw",
-                        "code-directory-serialized",
-                        "code-directory",
-                        "linkedit-info",
-                        "linkedit-segment-raw",
-                        "macho-load-commands",
-                        "macho-segments",
-                        "macho-target",
-                        "requirements-raw",
-                        "requirements-rust",
-                        "requirements-serialized-raw",
-                        "requirements-serialized",
-                        "requirements",
-                        "signature-raw",
-                        "superblob",
-                    ])
-                    .default_value("linkedit-info")
-                    .help("Which data to extract and how to format it"),
-            )
-            .arg(
-                Arg::new("universal_index")
-                    .long("universal-index")
-                    .action(ArgAction::Set)
-                    .default_value("0")
-                    .help("Index of Mach-O binary to operate on within a universal/fat binary"),
-            ),
-    );
-
-    let app = app.subcommand(
-        add_certificate_source_args(Command::new("generate-certificate-signing-request")
-            .about("Generates a certificate signing request that can be sent to Apple and exchanged for a signing certificate")
-            .arg(
-                Arg::new("csr_pem_path")
-                    .long("csr-pem-path")
-                    .action(ArgAction::Set)
-                    .help("Path to file to write PEM encoded CSR to")
-            )
-    ));
-
-    let app = app.subcommand(
-        Command::new("generate-self-signed-certificate")
-            .about("Generate a self-signed certificate for code signing")
-            .long_about(GENERATE_SELF_SIGNED_CERTIFICATE_ABOUT)
-            .arg(
-                Arg::new("algorithm")
-                    .long("algorithm")
-                    .action(ArgAction::Set)
-                    .value_parser(["ecdsa", "ed25519"])
-                    .default_value("ecdsa")
-                    .help("Which key type to use"),
-            )
-            .arg(
-                Arg::new("profile")
-                    .long("profile")
-                    .action(ArgAction::Set)
-                    .value_parser(CertificateProfile::str_names())
-                    .default_value("apple-development"),
-            )
-            .arg(
-                Arg::new("team_id")
-                    .long("team-id")
-                    .action(ArgAction::Set)
-                    .default_value("unset")
-                    .help(
-                        "Team ID (this is a short string attached to your Apple Developer account)",
-                    ),
-            )
-            .arg(
-                Arg::new("person_name")
-                    .long("person-name")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("The name of the person this certificate is for"),
-            )
-            .arg(
-                Arg::new("country_name")
-                    .long("country-name")
-                    .action(ArgAction::Set)
-                    .default_value("XX")
-                    .help("Country Name (C) value for certificate identifier"),
-            )
-            .arg(
-                Arg::new("validity_days")
-                    .long("validity-days")
-                    .action(ArgAction::Set)
-                    .default_value("365")
-                    .help("How many days the certificate should be valid for"),
-            )
-            .arg(
-                Arg::new("pem_filename")
-                    .long("pem-filename")
-                    .action(ArgAction::Set)
-                    .help("Base name of files to write PEM encoded certificate to"),
-            ),
-    );
-
-    let app = app.
-        subcommand(Command::new("keychain-export-certificate-chain")
-            .about("Export Apple CA certificates from the macOS Keychain")
-            .arg(
-                Arg::new("domain")
-                    .long("domain")
-                    .action(ArgAction::Set)
-                    .value_parser(["user", "system", "common", "dynamic"])
-                    .default_value("user")
-                    .help("Keychain domain to operate on")
-            )
-            .arg(
-                Arg::new("password")
-                    .long("--password")
-                    .action(ArgAction::Set)
-                    .help("Password to unlock the Keychain")
-            )
-            .arg(
-                Arg::new("password_file")
-                    .long("--password-file")
-                    .action(ArgAction::Set)
-                    .conflicts_with("password")
-                    .help("File containing password to use to unlock the Keychain")
-            )
-           .arg(
-                Arg::new("no_print_self")
-                    .long("--no-print-self")
-                    .action(ArgAction::SetTrue)
-                    .help("Print only the issuing certificate chain, not the subject certificate")
-           )
-           .arg(
-               Arg::new("user_id")
-                    .long("--user-id")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("User ID value of code signing certificate to find and whose CA chain to export")
-           ),
-        );
-
-    let app = app.subcommand(
-        Command::new("keychain-print-certificates")
-            .about("Print information about certificates in the macOS keychain")
-            .arg(
-                Arg::new("domain")
-                    .long("--domain")
-                    .action(ArgAction::Set)
-                    .value_parser(["user", "system", "common", "dynamic"])
-                    .default_value("user")
-                    .help("Keychain domain to operate on"),
-            ),
-    );
-
-    let app = app.subcommand(add_notary_api_args(
-        Command::new("notary-log")
-            .about("Fetch the notarization log for a previous submission")
-            .arg(
-                Arg::new("submission_id")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("The ID of the previous submission to wait on"),
-            ),
-    ));
-
-    let app = app.subcommand(add_notary_api_args(
-        Command::new("notary-submit")
-            .about("Upload an asset to Apple for notarization and possibly staple it")
-            .long_about(NOTARIZE_ABOUT)
-            .alias("notarize")
-            .arg(
-                Arg::new("wait")
-                    .long("wait")
-                    .action(ArgAction::SetTrue)
-                    .help("Whether to wait for upload processing to complete"),
-            )
-            .arg(
-                Arg::new("max_wait_seconds")
-                    .long("max-wait-seconds")
-                    .action(ArgAction::Set)
-                    .default_value("600")
-                    .help("Maximum time in seconds to wait for the upload result"),
-            )
-            .arg(
-                Arg::new("staple")
-                    .long("staple")
-                    .action(ArgAction::SetTrue)
-                    .help(
-                        "Staple the notarization ticket after successful upload (implies --wait)",
-                    ),
-            )
-            .arg(
-                Arg::new("path")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("Path to asset to upload"),
-            ),
-    ));
-
-    let app = app.subcommand(add_notary_api_args(
-        Command::new("notary-wait")
-            .about("Wait for completion of a previous submission")
-            .arg(
-                Arg::new("max_wait_seconds")
-                    .long("max-wait-seconds")
-                    .action(ArgAction::Set)
-                    .default_value("600")
-                    .help("Maximum time in seconds to wait for the upload result"),
-            )
-            .arg(
-                Arg::new("submission_id")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("The ID of the previous submission to wait on"),
-            ),
-    ));
-
-    let app = app.subcommand(
-        Command::new("parse-code-signing-requirement")
-            .about("Parse binary Code Signing Requirement data into a human readable string")
-            .long_about(PARSE_CODE_SIGNING_REQUIREMENT_ABOUT)
-            .arg(
-                Arg::new("format")
-                    .long("--format")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .value_parser(["csrl", "expression-tree"])
-                    .default_value("csrl")
-                    .help("Output format"),
-            )
-            .arg(
-                Arg::new("input_path")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("Path to file to parse"),
-            ),
-    );
-
-    let app = app.subcommand(
-        Command::new("print-signature-info")
-            .about("Print signature information for a filesystem path")
-            .arg(
-                Arg::new("path")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("Filesystem path to entity whose info to print"),
-            ),
-    );
-
-    let app = app.subcommand(
-        Command::new("smartcard-scan")
-            .about("Show information about available smartcard (SC) devices"),
-    );
-
-    let app = app.subcommand(add_yubikey_policy_args(
-        Command::new("smartcard-generate-key")
-            .about("Generate a new private key on a smartcard")
-            .arg(
-                Arg::new("smartcard_slot")
-                    .long("smartcard-slot")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("Smartcard slot number to store key in (9c is common)"),
-            ),
-    ));
-
-    let app = app.subcommand(add_yubikey_policy_args(add_certificate_source_args(
-        Command::new("smartcard-import")
-            .about("Import a code signing certificate and key into a smartcard")
-            .arg(
-                Arg::new("existing_key")
-                    .long("existing-key")
-                    .action(ArgAction::SetTrue)
-                    .help("Re-use the existing private key in the smartcard slot"),
-            )
-            .arg(
-                Arg::new("dry_run")
-                    .long("dry-run")
-                    .action(ArgAction::SetTrue)
-                    .help("Don't actually perform the import"),
-            ),
-    )));
-
-    let app = app.subcommand(add_certificate_source_args(
-        Command::new("remote-sign")
-            .about("Create signatures initiated from a remote signing operation")
-            .arg(
-                Arg::new("session_join_string_editor")
-                    .long("editor")
-                    .action(ArgAction::SetTrue)
-                    .help("Open an editor to input the session join string"),
-            )
-            .arg(
-                Arg::new("session_join_string_path")
-                    .long("sjs-path")
-                    .action(ArgAction::Set)
-                    .help("Path to file containing session join string"),
-            )
-            .arg(
-                Arg::new("session_join_string")
-                    .action(ArgAction::Set)
-                    .help("Session join string (provided by the signing initiator)"),
-            )
-            .group(
-                ArgGroup::new("session_join_string_source")
-                    .arg("session_join_string_editor")
-                    .arg("session_join_string_path")
-                    .arg("session_join_string")
-                    .required(true),
-            ),
-    ));
-
-    let app = app
-        .subcommand(
-            add_certificate_source_args(Command::new("sign")
-                .about("Sign a Mach-O binary or bundle")
-                .long_about(SIGN_ABOUT)
-                .arg(
-                    Arg::new("binary_identifier")
-                        .long("binary-identifier")
-                        .action(ArgAction::Append)
-                        .help("Identifier string for binary. The value normally used by CFBundleIdentifier")
-                )
-                .arg(
-                    Arg::new("code_requirements_path")
-                        .long("code-requirements-path")
-                        .action(ArgAction::Append)
-                        .help("Path to a file containing binary code requirements data to be used as designated requirements")
-                )
-                .arg(
-                    Arg::new("code_resources")
-                        .long("code-resources-path")
-                        .action(ArgAction::Append)
-                        .help("Path to an XML plist file containing code resources"),
-                )
-                .arg(
-                    Arg::new("code_signature_flags_set")
-                        .long("code-signature-flags")
-                        .action(ArgAction::Append)
-                        .value_parser(CodeSignatureFlags::all_user_configurable())
-                        .help("Code signature flags to set")
-                )
-                .arg(
-                    Arg::new("digest")
-                        .long("digest")
-                        .action(ArgAction::Set)
-                        .value_parser(SUPPORTED_HASHES)
-                        .default_value("sha256")
-                        .help("Digest algorithm to use")
-                )
-                .arg(Arg::new("extra_digest")
-                    .long("extra-digest")
-                    .action(ArgAction::Append)
-                    .value_parser(SUPPORTED_HASHES)
-                    .help("Extra digests to include in signatures")
-                )
-                .arg(
-                    Arg::new("entitlements_xml_path")
-                        .long("entitlements-xml-path")
-                        .short('e')
-                        .action(ArgAction::Append)
-                        .help("Path to a plist file containing entitlements"),
-                )
-                .arg(
-                    Arg::new("runtime_version")
-                        .long("runtime-version")
-                        .action(ArgAction::Append)
-                        .help("Hardened runtime version to use (defaults to SDK version used to build binary)"))
-                .arg(
-                    Arg::new("include_as_regular_files")
-                        .long("include-as-regular-files")
-                        .action(ArgAction::Append)
-                        .help("Include specified files as regular files during signing using regex matching rules")
-                )
-                .arg(
-                    Arg::new("info_plist_path")
-                        .long("info-plist-path")
-                        .action(ArgAction::Append)
-                        .help("Path to an Info.plist file whose digest to include in Mach-O signature")
-                )
-                .arg(
-                    Arg::new(
-                        "team_name")
-                        .long("team-name")
-                        .action(ArgAction::Set)
-                        .help("Team name/identifier to include in code signature"
-                    )
-                )
-                .arg(
-                    Arg::new("timestamp_url")
-                        .long("timestamp-url")
-                        .action(ArgAction::Set)
-                        .default_value(APPLE_TIMESTAMP_URL)
-                        .help(
-                            "URL of timestamp server to use to obtain a token of the CMS signature",
-                        ),
-                )
-                .arg(
-                    Arg::new("exclude")
-                        .long("exclude")
-                        .action(ArgAction::Append)
-                        .help("Glob expression of paths to exclude from signing")
-                )
-                .arg(
-                    Arg::new("smartcard_pin_env")
-                        .long("smartcard-pin-env")
-                        .conflicts_with_all(remote_initialization_args(Some(
-                            "smartcard_pin_env",
-                        )))
-                        .action(ArgAction::Set)
-                        .help("Environment variable holding the smartcard PIN"),
-                )
-                .arg(
-                    Arg::new("input_path")
-                        .action(ArgAction::Set)
-                        .required(true)
-                        .help("Path to Mach-O binary to sign"),
-                )
-                .arg(
-                    Arg::new("output_path")
-                        .action(ArgAction::Set)
-                        .help("Path to signed Mach-O binary to write"),
-                ),
-        ));
-
-    let app = app.subcommand(
-        Command::new("staple")
-            .about("Staples a notarization ticket to an entity")
-            .arg(
-                Arg::new("path")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("Path to entity to attempt to staple"),
-            ),
-    );
-
-    let app = app.subcommand(
-        Command::new("verify")
-            .about("Verifies code signature data")
-            .arg(
-                Arg::new("path")
-                    .action(ArgAction::Set)
-                    .required(true)
-                    .help("Path of Mach-O binary to examine"),
-            ),
-    );
-
-    let app = app.subcommand(
-        Command::new("x509-oids")
-            .about("Print information about X.509 OIDs related to Apple code signing"),
-    );
-
-    let matches = app.get_matches();
+    let cli = Cli::parse();
 
     // TODO make default log level warn once we audit logging sites.
-    let log_level = match matches.get_count("verbose") {
+    let log_level = match cli.verbose {
         0 => LevelFilter::Info,
         1 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
@@ -3082,39 +2742,42 @@ pub fn main_impl() -> Result<(), AppleCodesignError> {
 
     builder.init();
 
-    match matches.subcommand() {
-        Some(("analyze-certificate", args)) => command_analyze_certificate(args),
-        Some(("compute-code-hashes", args)) => command_compute_code_hashes(args),
-        Some(("diff-signatures", args)) => command_diff_signatures(args),
-        Some(("encode-app-store-connect-api-key", args)) => {
+    match &cli.command {
+        Subcommands::AnalyzeCertificate(args) => command_analyze_certificate(args),
+        Subcommands::ComputeCodeHashes(args) => command_compute_code_hashes(args),
+        Subcommands::DiffSignatures(args) => command_diff_signatures(args),
+        #[cfg(feature = "notarize")]
+        Subcommands::EncodeAppStoreConnectApiKey(args) => {
             command_encode_app_store_connect_api_key(args)
         }
-        Some(("extract", args)) => command_extract(args),
-        Some(("generate-certificate-signing-request", args)) => {
+        Subcommands::Extract(args) => command_extract(args),
+        Subcommands::GenerateCertificateSigningRequest(args) => {
             command_generate_certificate_signing_request(args)
         }
-        Some(("generate-self-signed-certificate", args)) => {
+        Subcommands::GenerateSelfSignedCertificate(args) => {
             command_generate_self_signed_certificate(args)
         }
-        Some(("keychain-export-certificate-chain", args)) => {
+        Subcommands::KeychainExportCertificateChain(args) => {
             command_keychain_export_certificate_chain(args)
         }
-        Some(("keychain-print-certificates", args)) => command_keychain_print_certificates(args),
-        Some(("notary-log", args)) => command_notary_log(args),
-        Some(("notary-submit", args)) => command_notary_submit(args),
-        Some(("notary-wait", args)) => command_notary_wait(args),
-        Some(("parse-code-signing-requirement", args)) => {
+        Subcommands::KeychainPrintCertificates(args) => command_keychain_print_certificates(args),
+        #[cfg(feature = "notarize")]
+        Subcommands::NotaryLog(args) => command_notary_log(args),
+        #[cfg(feature = "notarize")]
+        Subcommands::NotarySubmit(args) => command_notary_submit(args),
+        #[cfg(feature = "notarize")]
+        Subcommands::NotaryWait(args) => command_notary_wait(args),
+        Subcommands::ParseCodeSigningRequirement(args) => {
             command_parse_code_signing_requirement(args)
         }
-        Some(("print-signature-info", args)) => command_print_signature_info(args),
-        Some(("remote-sign", args)) => command_remote_sign(args),
-        Some(("sign", args)) => command_sign(args),
-        Some(("smartcard-generate-key", args)) => command_smartcard_generate_key(args),
-        Some(("smartcard-import", args)) => command_smartcard_import(args),
-        Some(("smartcard-scan", args)) => command_smartcard_scan(args),
-        Some(("staple", args)) => command_staple(args),
-        Some(("verify", args)) => command_verify(args),
-        Some(("x509-oids", args)) => command_x509_oids(args),
-        _ => Err(AppleCodesignError::CliUnknownCommand),
+        Subcommands::PrintSignatureInfo(args) => command_print_signature_info(args),
+        Subcommands::SmartcardScan => command_smartcard_scan(),
+        Subcommands::SmartcardGenerateKey(args) => command_smartcard_generate_key(args),
+        Subcommands::SmartcardImport(args) => command_smartcard_import(args),
+        Subcommands::RemoteSign(args) => command_remote_sign(args),
+        Subcommands::Sign(args) => command_sign(args),
+        Subcommands::Staple(args) => command_staple(args),
+        Subcommands::Verify(args) => command_verify(args),
+        Subcommands::X509Oids => command_x509_oids(),
     }
 }

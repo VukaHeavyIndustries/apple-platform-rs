@@ -4,7 +4,14 @@
 
 #[test]
 fn cli_tests() {
-    trycmd::TestCases::new()
-        .case("tests/cmd/*.trycmd")
-        .case("tests/cmd/*.toml");
+    let cases = trycmd::TestCases::new();
+
+    cases.case("tests/cmd/*.trycmd").case("tests/cmd/*.toml");
+
+    // Help output breaks without notarize feature.
+    if cfg!(not(feature = "notarize")) {
+        cases.skip("tests/cmd/encode-app-store-connect-api-key.trycmd");
+        cases.skip("tests/cmd/help.trycmd");
+        cases.skip("tests/cmd/notary*.trycmd");
+    }
 }
