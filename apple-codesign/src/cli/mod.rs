@@ -46,6 +46,7 @@ use {
 
 #[cfg(feature = "notarize")]
 use crate::notarization::Notarizer;
+use crate::CodeResourcesRule;
 
 #[cfg(feature = "yubikey")]
 use {
@@ -1151,6 +1152,10 @@ pub struct ScopedSigningArgs {
     #[arg(long = "runtime-version", value_name = "VERSION")]
     runtime_versions: Vec<String>,
 
+    /// Include specified files as regular files during signing using regex matching rules
+    #[arg(long = "include-as-regular-files", value_name = "REGULAR_FILE")]
+    regular_files_ruleset: Vec<String>,
+
     /// Path to an Info.plist file whose digest to include in Mach-O signature
     #[arg(
         long = "info-plist-file",
@@ -1188,6 +1193,8 @@ pub struct ScopedSigningSettingsValues {
     pub runtime_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub info_plist_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regular_files_ruleset: Vec<String>,
 }
 
 pub fn split_scoped_value(s: &str) -> (String, &str) {
@@ -1278,6 +1285,11 @@ impl TryFrom<&ScopedSigningArgs> for ScopedSigningSettings {
             res.entry(scope).or_default().info_plist_file = Some(value.into());
         }
 
+        for value in &args.regular_files_ruleset {
+            let (scope, value) = split_scoped_value(value);
+            res.entry(scope).or_default().regular_files_ruleset.push(value.into());
+        }
+
         Ok(Self(res))
     }
 }
@@ -1338,6 +1350,12 @@ impl ScopedSigningSettings {
                 settings.add_code_signature_flags(scope.clone(), flags);
             }
 
+            for value in values.regular_files_ruleset {
+                let rule = CodeResourcesRule::new(value)?.weight(21);
+                warn!("adding rule {:?} to {}", rule, scope);
+                settings.add_regular_file_rule(rule);
+            }
+
             for (i, value) in values.digests.into_iter().enumerate() {
                 let digest_type = DigestType::try_from(value.as_str())?;
 
@@ -1357,7 +1375,7 @@ impl ScopedSigningSettings {
                 let entitlements_data = std::fs::read_to_string(path)?;
                 settings.set_entitlements_xml(scope.clone(), entitlements_data)?;
             }
-
+            
             if let Some(path) = values.launch_constraints_self_file {
                 warn!(
                     "setting self launch constraints for {} from path {}",
