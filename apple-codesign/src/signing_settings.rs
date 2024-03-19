@@ -12,6 +12,7 @@ use {
         cryptography::DigestType,
         embedded_signature::{Blob, RequirementBlob},
         environment_constraints::EncodedEnvironmentConstraints,
+        code_resources::CodeResourcesRule,
         error::AppleCodesignError,
         macho::{parse_version_nibbles, MachFile},
     },
@@ -304,6 +305,7 @@ pub struct SigningSettings<'key> {
     path_exclusion_patterns: Vec<Pattern>,
     shallow: bool,
     for_notarization: bool,
+    regular_file_ruleset: Vec<CodeResourcesRule>,
 
     // Scope-specific settings.
     // These are BTreeMap so when we filter the keys, keys with higher precedence come
@@ -802,6 +804,14 @@ impl<'key> SigningSettings<'key> {
         self.info_plist_data.insert(scope, data);
     }
 
+    pub fn add_regular_file_rule(&mut self, rule: CodeResourcesRule) {
+        self.regular_file_ruleset.push(rule);
+    }
+
+    pub fn get_regular_file_ruleset(&self) -> &Vec<CodeResourcesRule> {
+        &self.regular_file_ruleset
+    }
+    
     /// Obtain the `CodeResources` XML file data registered to a given scope.
     pub fn code_resources_data(&self, scope: impl AsRef<SettingsScope>) -> Option<&[u8]> {
         self.code_resources_data
@@ -1282,6 +1292,7 @@ impl<'key> SigningSettings<'key> {
                     key_map(ScopedSetting::Digest, key).map(|key| (key, value))
                 })
                 .collect::<BTreeMap<_, _>>(),
+            regular_file_ruleset: self.regular_file_ruleset.clone(),
             identifiers: self
                 .identifiers
                 .clone()
