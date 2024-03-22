@@ -21,7 +21,7 @@ use {
         Mode, Oid,
     },
     bytes::Bytes,
-    log::{debug, error, info, warn},
+    log::{debug, error, warn},
     serde::{de::DeserializeOwned, Deserialize, Serialize},
     signature::Signer,
     std::{
@@ -38,6 +38,7 @@ use {
         CapturedX509Certificate, KeyAlgorithm, KeyInfoSigner, Sign, Signature, SignatureAlgorithm,
         X509CertificateError,
     },
+    zeroize::Zeroizing,
 };
 
 /// URL of default server to use.
@@ -364,7 +365,6 @@ fn create_websocket(
     req: impl IntoClientRequest,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, RemoteSignError> {
     let config = WebSocketConfig {
-        max_send_queue: Some(1),
         ..Default::default()
     };
 
@@ -380,7 +380,7 @@ fn wait_for_server_response(
     ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
 ) -> Result<ServerResponse, RemoteSignError> {
     loop {
-        match ws.read_message()? {
+        match ws.read()? {
             Message::Text(text) => {
                 let message = serde_json::from_str::<ServerMessage>(&text)?;
                 debug!(
@@ -615,7 +615,8 @@ impl UnjoinedSigningClient {
         };
 
         let body = serde_json::to_string(&message)?;
-        self.ws.write_message(body.into())?;
+        self.ws.send(body.into())?;
+        self.ws.flush()?;
 
         Ok(())
     }
@@ -669,7 +670,8 @@ impl PairedClient {
         };
 
         let body = serde_json::to_string(&message)?;
-        self.ws.write_message(body.into())?;
+        self.ws.send(body.into())?;
+        self.ws.flush()?;
 
         Ok(())
     }
@@ -770,7 +772,7 @@ impl PairedClient {
         )?;
 
         wait_for_server_message(&mut self.ws)?.into_result()?;
-        info!("relay server confirmed session termination");
+        warn!("relay server confirmed session termination");
 
         Ok(())
     }
@@ -935,12 +937,14 @@ impl Sign for InitiatorClient {
         }
     }
 
-    fn private_key_data(&self) -> Option<Vec<u8>> {
+    fn private_key_data(&self) -> Option<Zeroizing<Vec<u8>>> {
         // We never have access to private keys from the remote signer.
         None
     }
 
-    fn rsa_primes(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, X509CertificateError> {
+    fn rsa_primes(
+        &self,
+    ) -> Result<Option<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)>, X509CertificateError> {
         // We never have access to private keys from the remote signer.
         Ok(None)
     }
@@ -1046,7 +1050,7 @@ impl<'key> SigningClient<'key> {
         )?;
 
         wait_for_expected_server_message(&mut client.ws, ServerMessageType::MessageSent)?;
-        info!("relay acknowledged signature message received");
+        warn!("relay acknowledged signature message received");
 
         Ok(())
     }
@@ -1054,7 +1058,7 @@ impl<'key> SigningClient<'key> {
     fn process_next_message(&self) -> Result<bool, RemoteSignError> {
         let mut client = self.client.borrow_mut();
 
-        info!("waiting for server to send us a message...");
+        warn!("waiting for server to send us a message...");
         let res = if let Some(res) = client.wait_for_peer_message()? {
             res
         } else {

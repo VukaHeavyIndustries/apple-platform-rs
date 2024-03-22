@@ -1,6 +1,6 @@
 ```
 $ rcodesign help encode-app-store-connect-api-key
-Encode an App Store Connect API Key to JSON.
+Encode App Store Connect API Key metadata to JSON
 
 App Store Connect API Keys
 (https://developer.apple.com/documentation/appstoreconnectapi/creating_api_keys_for_app_store_connect_api)
@@ -31,7 +31,6 @@ to the file. However, file access restrictions may not be as secure as you
 want. Security conscious individuals should audit the permissions of the
 file and adjust accordingly.
 
-
 Usage: rcodesign[EXE] encode-app-store-connect-api-key [OPTIONS] <ISSUER_ID> <KEY_ID> <PRIVATE_KEY_PATH>
 
 Arguments:
@@ -45,8 +44,22 @@ Arguments:
           Path to a file containing the private key downloaded from Apple
 
 Options:
+  -C, --config-file <CONFIG_PATH>
+          Explicit configuration file to load.
+          
+          If provided, the default configuration files are not loaded, even if they exist.
+          
+          Can be specified multiple times. Files are loaded/merged in the order given.
+          
+          The special value `/dev/null` can be used to specify an empty/null config file. It can be used to short-circuit loading of default config files.
+
   -o, --output-path <OUTPUT_PATH>
           Path to a JSON file to create the output to
+
+  -P, --profile <PROFILE>
+          Configuration profile to load.
+          
+          If not specified, the implicit "default" profile is loaded.
 
   -v, --verbose...
           Increase logging verbosity. Can be specified multiple times

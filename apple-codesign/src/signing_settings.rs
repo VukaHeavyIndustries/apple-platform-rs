@@ -6,11 +6,13 @@
 
 use {
     crate::{
-        certificate::AppleCertificate,
+        certificate::{AppleCertificate, CodeSigningCertificateExtension},
         code_directory::CodeSignatureFlags,
         code_requirement::CodeRequirementExpression,
+        cryptography::DigestType,
+        embedded_signature::{Blob, RequirementBlob},
+        environment_constraints::EncodedEnvironmentConstraints,
         code_resources::CodeResourcesRule,
-        embedded_signature::{Blob, DigestType, RequirementBlob},
         error::AppleCodesignError,
         macho::{parse_version_nibbles, MachFile},
     },
@@ -18,7 +20,7 @@ use {
     goblin::mach::cputype::{
         CpuType, CPU_TYPE_ARM, CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_X86_64,
     },
-    log::info,
+    log::{error, info},
     reqwest::{IntoUrl, Url},
     std::{
         collections::{BTreeMap, BTreeSet},
@@ -229,6 +231,52 @@ pub enum DesignatedRequirementMode {
     Explicit(Vec<Vec<u8>>),
 }
 
+/// Describes the type of a scoped setting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScopedSetting {
+    Digest,
+    BinaryIdentifier,
+    Entitlements,
+    DesignatedRequirements,
+    CodeSignatureFlags,
+    RuntimeVersion,
+    InfoPlist,
+    CodeResources,
+    ExtraDigests,
+    LaunchConstraintsSelf,
+    LaunchConstraintsParent,
+    LaunchConstraintsResponsible,
+    LibraryConstraints,
+}
+
+impl ScopedSetting {
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Digest,
+            Self::BinaryIdentifier,
+            Self::Entitlements,
+            Self::DesignatedRequirements,
+            Self::CodeSignatureFlags,
+            Self::RuntimeVersion,
+            Self::InfoPlist,
+            Self::CodeResources,
+            Self::ExtraDigests,
+            Self::LaunchConstraintsSelf,
+            Self::LaunchConstraintsParent,
+            Self::LaunchConstraintsResponsible,
+            Self::LibraryConstraints,
+        ]
+    }
+
+    pub fn inherit_nested_bundle() -> &'static [Self] {
+        &[Self::Digest, Self::ExtraDigests, Self::RuntimeVersion]
+    }
+
+    pub fn inherit_nested_macho() -> &'static [Self] {
+        &[Self::Digest, Self::ExtraDigests, Self::RuntimeVersion]
+    }
+}
+
 /// Represents code signing settings.
 ///
 /// This type holds settings related to a single logical signing operation.
@@ -253,13 +301,16 @@ pub struct SigningSettings<'key> {
     signing_key: Option<(&'key dyn KeyInfoSigner, CapturedX509Certificate)>,
     certificates: Vec<CapturedX509Certificate>,
     time_stamp_url: Option<Url>,
-    digest_type: DigestType,
+    signing_time: Option<chrono::DateTime<chrono::Utc>>,
     path_exclusion_patterns: Vec<Pattern>,
+    shallow: bool,
+    for_notarization: bool,
     regular_file_ruleset: Vec<CodeResourcesRule>,
 
     // Scope-specific settings.
     // These are BTreeMap so when we filter the keys, keys with higher precedence come
     // last and last write wins.
+    digest_type: BTreeMap<SettingsScope, DigestType>,
     team_id: BTreeMap<SettingsScope, String>,
     identifiers: BTreeMap<SettingsScope, String>,
     entitlements: BTreeMap<SettingsScope, plist::Value>,
@@ -269,23 +320,13 @@ pub struct SigningSettings<'key> {
     info_plist_data: BTreeMap<SettingsScope, Vec<u8>>,
     code_resources_data: BTreeMap<SettingsScope, Vec<u8>>,
     extra_digests: BTreeMap<SettingsScope, BTreeSet<DigestType>>,
+    launch_constraints_self: BTreeMap<SettingsScope, EncodedEnvironmentConstraints>,
+    launch_constraints_parent: BTreeMap<SettingsScope, EncodedEnvironmentConstraints>,
+    launch_constraints_responsible: BTreeMap<SettingsScope, EncodedEnvironmentConstraints>,
+    library_constraints: BTreeMap<SettingsScope, EncodedEnvironmentConstraints>,
 }
 
 impl<'key> SigningSettings<'key> {
-    /// Obtain the digest type to use.
-    pub fn digest_type(&self) -> &DigestType {
-        &self.digest_type
-    }
-
-    /// Set the content digest to use.
-    ///
-    /// The default is SHA-256. Changing this to SHA-1 can weaken security of digital
-    /// signatures and may prevent the binary from running in environments that enforce
-    /// more modern signatures.
-    pub fn set_digest_type(&mut self, digest_type: DigestType) {
-        self.digest_type = digest_type;
-    }
-
     /// Obtain the signing key to use.
     pub fn signing_key(&self) -> Option<(&'key dyn KeyInfoSigner, &CapturedX509Certificate)> {
         self.signing_key.as_ref().map(|(key, cert)| (*key, cert))
@@ -327,6 +368,15 @@ impl<'key> SigningSettings<'key> {
             }
         } else {
             None
+        }
+    }
+
+    /// Whether the signing certificate is signed by Apple.
+    pub fn signing_certificate_apple_signed(&self) -> bool {
+        if let Some((_, cert)) = &self.signing_key {
+            cert.chains_to_apple_root_ca()
+        } else {
+            false
         }
     }
 
@@ -393,6 +443,20 @@ impl<'key> SigningSettings<'key> {
         Ok(())
     }
 
+    /// Obtain the signing time to embed in signatures.
+    ///
+    /// If None, the current time at the time of signing is used.
+    pub fn signing_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.signing_time
+    }
+
+    /// Set the signing time to embed in signatures.
+    ///
+    /// If not called, the current time at time of signing will be used.
+    pub fn set_signing_time(&mut self, time: chrono::DateTime<chrono::Utc>) {
+        self.signing_time = Some(time);
+    }
+
     /// Obtain the team identifier for signed binaries.
     pub fn team_id(&self) -> Option<&str> {
         self.team_id.get(&SettingsScope::Main).map(|x| x.as_str())
@@ -420,7 +484,10 @@ impl<'key> SigningSettings<'key> {
     /// Returns `Some` if a team ID was set from the signing certificate or `None`
     /// otherwise.
     pub fn set_team_id_from_signing_certificate(&mut self) -> Option<&str> {
-        if let Some((_, cert)) = &self.signing_key {
+        // The team ID is only included for Apple signed certificates.
+        if !self.signing_certificate_apple_signed() {
+            None
+        } else if let Some((_, cert)) = &self.signing_key {
             if let Some(team_id) = cert.apple_team_id() {
                 self.set_team_id(team_id);
                 Some(
@@ -436,17 +503,60 @@ impl<'key> SigningSettings<'key> {
         }
     }
 
-    /// Return relative paths that should be excluded from signing.
-    ///
-    /// Values are glob pattern matches as defined the by `glob` crate.
-    pub fn path_exclusion_patterns(&self) -> &[Pattern] {
-        &self.path_exclusion_patterns
+    /// Whether a given path matches a path exclusion pattern.
+    pub fn path_exclusion_pattern_matches(&self, path: &str) -> bool {
+        self.path_exclusion_patterns
+            .iter()
+            .any(|pattern| pattern.matches(path))
     }
 
     /// Add a path to the exclusions list.
     pub fn add_path_exclusion(&mut self, v: &str) -> Result<(), AppleCodesignError> {
         self.path_exclusion_patterns.push(Pattern::new(v)?);
         Ok(())
+    }
+
+    /// Whether to perform a shallow, non-nested signing operation.
+    ///
+    /// Can mean different things to different entities. For bundle signing, shallow
+    /// mode means not to recurse into nested bundles.
+    pub fn shallow(&self) -> bool {
+        self.shallow
+    }
+
+    /// Set whether to perform a shallow signing operation.
+    pub fn set_shallow(&mut self, v: bool) {
+        self.shallow = v;
+    }
+
+    /// Whether the signed asset will later be notarized.
+    ///
+    /// This serves as a hint to engage additional signing settings that are required
+    /// for an asset to be successfully notarized by Apple.
+    pub fn for_notarization(&self) -> bool {
+        self.for_notarization
+    }
+
+    /// Set whether to engage notarization compatibility mode.
+    pub fn set_for_notarization(&mut self, v: bool) {
+        self.for_notarization = v;
+    }
+
+    /// Obtain the primary digest type to use.
+    pub fn digest_type(&self, scope: impl AsRef<SettingsScope>) -> DigestType {
+        self.digest_type
+            .get(scope.as_ref())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Set the content digest to use.
+    ///
+    /// The default is SHA-256. Changing this to SHA-1 can weaken security of digital
+    /// signatures and may prevent the binary from running in environments that enforce
+    /// more modern signatures.
+    pub fn set_digest_type(&mut self, scope: SettingsScope, digest_type: DigestType) {
+        self.digest_type.insert(scope, digest_type);
     }
 
     /// Obtain the binary identifier string for a given scope.
@@ -586,7 +696,21 @@ impl<'key> SigningSettings<'key> {
         &self,
         scope: impl AsRef<SettingsScope>,
     ) -> Option<CodeSignatureFlags> {
-        self.code_signature_flags.get(scope.as_ref()).copied()
+        let mut flags = self.code_signature_flags.get(scope.as_ref()).copied();
+
+        if self.for_notarization {
+            flags.get_or_insert(CodeSignatureFlags::default());
+
+            flags.as_mut().map(|flags| {
+                if !flags.contains(CodeSignatureFlags::RUNTIME) {
+                    info!("adding hardened runtime flag because notarization mode enabled");
+                }
+
+                flags.insert(CodeSignatureFlags::RUNTIME);
+            });
+        }
+
+        flags
     }
 
     /// Set code signature flags for signed Mach-O binaries.
@@ -737,13 +861,82 @@ impl<'key> SigningSettings<'key> {
 
     /// Obtain all configured digests for a scope.
     pub fn all_digests(&self, scope: SettingsScope) -> Vec<DigestType> {
-        let mut res = vec![self.digest_type];
+        let mut res = vec![self.digest_type(scope.clone())];
 
         if let Some(extra) = self.extra_digests(scope) {
             res.extend(extra.iter());
         }
 
         res
+    }
+
+    /// Obtain the launch constraints on self.
+    pub fn launch_constraints_self(
+        &self,
+        scope: impl AsRef<SettingsScope>,
+    ) -> Option<&EncodedEnvironmentConstraints> {
+        self.launch_constraints_self.get(scope.as_ref())
+    }
+
+    /// Set the launch constraints on the current binary.
+    pub fn set_launch_constraints_self(
+        &mut self,
+        scope: SettingsScope,
+        constraints: EncodedEnvironmentConstraints,
+    ) {
+        self.launch_constraints_self.insert(scope, constraints);
+    }
+
+    /// Obtain the launch constraints on the parent process.
+    pub fn launch_constraints_parent(
+        &self,
+        scope: impl AsRef<SettingsScope>,
+    ) -> Option<&EncodedEnvironmentConstraints> {
+        self.launch_constraints_parent.get(scope.as_ref())
+    }
+
+    /// Set the launch constraints on the parent process.
+    pub fn set_launch_constraints_parent(
+        &mut self,
+        scope: SettingsScope,
+        constraints: EncodedEnvironmentConstraints,
+    ) {
+        self.launch_constraints_parent.insert(scope, constraints);
+    }
+
+    /// Obtain the launch constraints on the responsible process.
+    pub fn launch_constraints_responsible(
+        &self,
+        scope: impl AsRef<SettingsScope>,
+    ) -> Option<&EncodedEnvironmentConstraints> {
+        self.launch_constraints_responsible.get(scope.as_ref())
+    }
+
+    /// Set the launch constraints on the responsible process.
+    pub fn set_launch_constraints_responsible(
+        &mut self,
+        scope: SettingsScope,
+        constraints: EncodedEnvironmentConstraints,
+    ) {
+        self.launch_constraints_responsible
+            .insert(scope, constraints);
+    }
+
+    /// Obtain the constraints on loaded libraries.
+    pub fn library_constraints(
+        &self,
+        scope: impl AsRef<SettingsScope>,
+    ) -> Option<&EncodedEnvironmentConstraints> {
+        self.library_constraints.get(scope.as_ref())
+    }
+
+    /// Set the constraints on loaded libraries.
+    pub fn set_library_constraints(
+        &mut self,
+        scope: SettingsScope,
+        constraints: EncodedEnvironmentConstraints,
+    ) {
+        self.library_constraints.insert(scope, constraints);
     }
 
     /// Import existing state from Mach-O data.
@@ -754,6 +947,8 @@ impl<'key> SigningSettings<'key> {
     /// the Mach-O is imported into the settings.
     pub fn import_settings_from_macho(&mut self, data: &[u8]) -> Result<(), AppleCodesignError> {
         info!("inferring default signing settings from Mach-O binary");
+
+        let mut seen_identifier = None;
 
         for macho in MachFile::parse(data)?.into_iter() {
             let index = macho.index.unwrap_or(0);
@@ -766,7 +961,10 @@ impl<'key> SigningSettings<'key> {
             // signatures. If the minimum version targeting in the binary doesn't
             // support SHA-256, we automatically change the digest targeting settings
             // so the binary will be signed correctly.
-            if let Some(targeting) = macho.find_targeting()? {
+            //
+            // And to maintain compatibility with Apple's tooling, if no targeting
+            // settings are present we also opt into SHA-1 + SHA-256.
+            let need_sha1_sha256 = if let Some(targeting) = macho.find_targeting()? {
                 let sha256_version = targeting.platform.sha256_digest_support()?;
 
                 if !sha256_version.matches(&targeting.minimum_os_version) {
@@ -774,16 +972,24 @@ impl<'key> SigningSettings<'key> {
                         "activating SHA-1 digests because minimum OS target {} is not {}",
                         targeting.minimum_os_version, sha256_version
                     );
-
-                    // This logic is a bit wonky. We want SHA-1 to be present on all binaries
-                    // within a fat binary. So if we need SHA-1 mode, we set the setting on the
-                    // main scope and then clear any overrides on fat binary scopes so our
-                    // settings are canonical.
-                    self.set_digest_type(DigestType::Sha1);
-                    self.add_extra_digest(scope_main.clone(), DigestType::Sha256);
-                    self.extra_digests.remove(&scope_arch);
-                    self.extra_digests.remove(&scope_index);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                info!("activating SHA-1 digests because no platform targeting in Mach-O");
+                true
+            };
+
+            if need_sha1_sha256 {
+                // This logic is a bit wonky. We want SHA-1 to be present on all binaries
+                // within a fat binary. So if we need SHA-1 mode, we set the setting on the
+                // main scope and then clear any overrides on fat binary scopes so our
+                // settings are canonical.
+                self.set_digest_type(scope_main.clone(), DigestType::Sha1);
+                self.add_extra_digest(scope_main.clone(), DigestType::Sha256);
+                self.extra_digests.remove(&scope_arch);
+                self.extra_digests.remove(&scope_index);
             }
 
             // The Mach-O can have embedded Info.plist data. Use it if available and not
@@ -807,9 +1013,22 @@ impl<'key> SigningSettings<'key> {
                         || self.binary_identifier(&scope_arch).is_some()
                     {
                         info!("using binary identifier from settings");
+                    } else if let Some(initial_identifier) = &seen_identifier {
+                        // The binary identifier should agree between all Mach-O within a
+                        // universal binary. If we've already seen an identifier, use it
+                        // implicitly.
+                        if initial_identifier != cd.ident.as_ref() {
+                            info!("identifiers within Mach-O do not agree (initial: {initial_identifier}, subsequent: {}); reconciling to {initial_identifier}",
+                            cd.ident);
+                            self.set_binary_identifier(scope_index.clone(), initial_identifier);
+                        }
                     } else {
-                        info!("preserving existing binary identifier in Mach-O");
-                        self.set_binary_identifier(scope_index.clone(), cd.ident);
+                        info!(
+                            "preserving existing binary identifier in Mach-O ({})",
+                            cd.ident.to_string()
+                        );
+                        self.set_binary_identifier(scope_index.clone(), cd.ident.to_string());
+                        seen_identifier = Some(cd.ident.to_string());
                     }
 
                     if self.team_id.contains_key(&scope_main)
@@ -818,9 +1037,18 @@ impl<'key> SigningSettings<'key> {
                     {
                         info!("using team ID from settings");
                     } else if let Some(team_id) = cd.team_name {
-                        info!("preserving team ID in existing Mach-O signature");
-                        self.team_id
-                            .insert(scope_index.clone(), team_id.to_string());
+                        // Team ID is only included when signing with an Apple signed
+                        // certificate.
+                        if self.signing_certificate_apple_signed() {
+                            info!(
+                                "preserving team ID in existing Mach-O signature ({})",
+                                team_id
+                            );
+                            self.team_id
+                                .insert(scope_index.clone(), team_id.to_string());
+                        } else {
+                            info!("dropping team ID {} because not signing with an Apple signed certificate", team_id);
+                        }
                     }
 
                     if self.code_signature_flags(&scope_main).is_some()
@@ -829,7 +1057,10 @@ impl<'key> SigningSettings<'key> {
                     {
                         info!("using code signature flags from settings");
                     } else if !cd.flags.is_empty() {
-                        info!("preserving code signature flags in existing Mach-O signature");
+                        info!(
+                            "preserving code signature flags in existing Mach-O signature ({:?})",
+                            cd.flags
+                        );
                         self.set_code_signature_flags(scope_index.clone(), cd.flags);
                     }
 
@@ -839,11 +1070,13 @@ impl<'key> SigningSettings<'key> {
                     {
                         info!("using runtime version from settings");
                     } else if let Some(version) = cd.runtime {
-                        info!("preserving runtime version in existing Mach-O signature");
-                        self.set_runtime_version(
-                            scope_index.clone(),
-                            parse_version_nibbles(version),
+                        let version = parse_version_nibbles(version);
+
+                        info!(
+                            "preserving runtime version in existing Mach-O signature ({})",
+                            version
                         );
+                        self.set_runtime_version(scope_index.clone(), version);
                     }
                 }
 
@@ -861,6 +1094,68 @@ impl<'key> SigningSettings<'key> {
                         )?;
                     }
                 }
+
+                if let Some(constraints) = sig.launch_constraints_self()? {
+                    if self.launch_constraints_self(&scope_main).is_some()
+                        || self.launch_constraints_self(&scope_index).is_some()
+                        || self.launch_constraints_self(&scope_arch).is_some()
+                    {
+                        info!("using self launch constraints from settings");
+                    } else {
+                        info!("preserving existing self launch constraints in Mach-O");
+                        self.set_launch_constraints_self(
+                            SettingsScope::MultiArchIndex(index),
+                            constraints.parse_encoded_constraints()?,
+                        );
+                    }
+                }
+
+                if let Some(constraints) = sig.launch_constraints_parent()? {
+                    if self.launch_constraints_parent(&scope_main).is_some()
+                        || self.launch_constraints_parent(&scope_index).is_some()
+                        || self.launch_constraints_parent(&scope_arch).is_some()
+                    {
+                        info!("using parent launch constraints from settings");
+                    } else {
+                        info!("preserving existing parent launch constraints in Mach-O");
+                        self.set_launch_constraints_parent(
+                            SettingsScope::MultiArchIndex(index),
+                            constraints.parse_encoded_constraints()?,
+                        );
+                    }
+                }
+
+                if let Some(constraints) = sig.launch_constraints_responsible()? {
+                    if self.launch_constraints_responsible(&scope_main).is_some()
+                        || self.launch_constraints_responsible(&scope_index).is_some()
+                        || self.launch_constraints_responsible(&scope_arch).is_some()
+                    {
+                        info!("using responsible process launch constraints from settings");
+                    } else {
+                        info!(
+                            "preserving existing responsible process launch constraints in Mach-O"
+                        );
+                        self.set_launch_constraints_responsible(
+                            SettingsScope::MultiArchIndex(index),
+                            constraints.parse_encoded_constraints()?,
+                        );
+                    }
+                }
+
+                if let Some(constraints) = sig.library_constraints()? {
+                    if self.library_constraints(&scope_main).is_some()
+                        || self.library_constraints(&scope_index).is_some()
+                        || self.library_constraints(&scope_arch).is_some()
+                    {
+                        info!("using library constraints from settings");
+                    } else {
+                        info!("preserving existing library constraints in Mach-O");
+                        self.set_library_constraints(
+                            SettingsScope::MultiArchIndex(index),
+                            constraints.parse_encoded_constraints()?,
+                        );
+                    }
+                }
             }
         }
 
@@ -870,23 +1165,39 @@ impl<'key> SigningSettings<'key> {
     /// Convert this instance to settings appropriate for a nested bundle.
     #[must_use]
     pub fn as_nested_bundle_settings(&self, bundle_path: &str) -> Self {
-        self.clone_strip_prefix(bundle_path, format!("{bundle_path}/"))
+        self.clone_strip_prefix(
+            bundle_path,
+            format!("{bundle_path}/"),
+            ScopedSetting::inherit_nested_bundle(),
+        )
+    }
+
+    /// Obtain the settings for a bundle's main executable.
+    #[must_use]
+    pub fn as_bundle_main_executable_settings(&self, path: &str) -> Self {
+        self.clone_strip_prefix(path, path.to_string(), ScopedSetting::all())
     }
 
     /// Convert this instance to settings appropriate for a Mach-O binary in a bundle.
+    ///
+    /// Only some settings are inherited from the bundle.
     #[must_use]
     pub fn as_bundle_macho_settings(&self, path: &str) -> Self {
-        self.clone_strip_prefix(path, path.to_string())
+        self.clone_strip_prefix(
+            path,
+            path.to_string(),
+            ScopedSetting::inherit_nested_macho(),
+        )
     }
 
-    /// Convert this instance to settings appropriate for a nested Mach-O binary.
+    /// Convert this instance to settings appropriate for a Mach-O within a universal one.
     ///
     /// It is assumed the main scope of these settings is already targeted for
     /// a Mach-O binary. Any scoped settings for the Mach-O binary index and CPU type
     /// will be applied. CPU type settings take precedence over index scoped settings.
     #[must_use]
-    pub fn as_nested_macho_settings(&self, index: usize, cpu_type: CpuType) -> Self {
-        self.clone_with_filter_map(|key| {
+    pub fn as_universal_macho_settings(&self, index: usize, cpu_type: CpuType) -> Self {
+        self.clone_with_filter_map(|_, key| {
             if key == SettingsScope::Main
                 || key == SettingsScope::MultiArchCpuType(cpu_type)
                 || key == SettingsScope::MultiArchIndex(index)
@@ -900,9 +1211,20 @@ impl<'key> SigningSettings<'key> {
 
     // Clones this instance, promoting `main_path` to the main scope and stripping
     // a prefix from other keys.
-    fn clone_strip_prefix(&self, main_path: &str, prefix: String) -> Self {
-        self.clone_with_filter_map(|key| match key {
-            SettingsScope::Main => Some(SettingsScope::Main),
+    fn clone_strip_prefix(
+        &self,
+        main_path: &str,
+        prefix: String,
+        preserve_settings: &[ScopedSetting],
+    ) -> Self {
+        self.clone_with_filter_map(|setting, key| match key {
+            SettingsScope::Main => {
+                if preserve_settings.contains(&setting) {
+                    Some(SettingsScope::Main)
+                } else {
+                    None
+                }
+            }
             SettingsScope::Path(path) => {
                 if path == main_path {
                     Some(SettingsScope::Main)
@@ -911,10 +1233,25 @@ impl<'key> SigningSettings<'key> {
                         .map(|path| SettingsScope::Path(path.to_string()))
                 }
             }
-            SettingsScope::MultiArchIndex(index) => Some(SettingsScope::MultiArchIndex(index)),
-            SettingsScope::MultiArchCpuType(cpu_type) => {
-                Some(SettingsScope::MultiArchCpuType(cpu_type))
+
+            // Top-level multiarch settings are a bit wonky: it doesn't really
+            // make much sense for them to propagate across binaries. But we do
+            // allow it.
+            SettingsScope::MultiArchIndex(index) => {
+                if preserve_settings.contains(&setting) {
+                    Some(SettingsScope::MultiArchIndex(index))
+                } else {
+                    None
+                }
             }
+            SettingsScope::MultiArchCpuType(cpu_type) => {
+                if preserve_settings.contains(&setting) {
+                    Some(SettingsScope::MultiArchCpuType(cpu_type))
+                } else {
+                    None
+                }
+            }
+
             SettingsScope::PathMultiArchIndex(path, index) => {
                 if path == main_path {
                     Some(SettingsScope::MultiArchIndex(index))
@@ -936,64 +1273,166 @@ impl<'key> SigningSettings<'key> {
 
     fn clone_with_filter_map(
         &self,
-        key_map: impl Fn(SettingsScope) -> Option<SettingsScope>,
+        key_map: impl Fn(ScopedSetting, SettingsScope) -> Option<SettingsScope>,
     ) -> Self {
         Self {
             signing_key: self.signing_key.clone(),
             certificates: self.certificates.clone(),
             time_stamp_url: self.time_stamp_url.clone(),
+            signing_time: self.signing_time,
             team_id: self.team_id.clone(),
-            digest_type: self.digest_type,
             path_exclusion_patterns: self.path_exclusion_patterns.clone(),
+            shallow: self.shallow,
+            for_notarization: self.for_notarization,
+            digest_type: self
+                .digest_type
+                .clone()
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::Digest, key).map(|key| (key, value))
+                })
+                .collect::<BTreeMap<_, _>>(),
             regular_file_ruleset: self.regular_file_ruleset.clone(),
             identifiers: self
                 .identifiers
                 .clone()
                 .into_iter()
-                .filter_map(|(key, value)| key_map(key).map(|key| (key, value)))
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::BinaryIdentifier, key).map(|key| (key, value))
+                })
                 .collect::<BTreeMap<_, _>>(),
             entitlements: self
                 .entitlements
                 .clone()
                 .into_iter()
-                .filter_map(|(key, value)| key_map(key).map(|key| (key, value)))
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::Entitlements, key).map(|key| (key, value))
+                })
                 .collect::<BTreeMap<_, _>>(),
             designated_requirement: self
                 .designated_requirement
                 .clone()
                 .into_iter()
-                .filter_map(|(key, value)| key_map(key).map(|key| (key, value)))
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::DesignatedRequirements, key).map(|key| (key, value))
+                })
                 .collect::<BTreeMap<_, _>>(),
             code_signature_flags: self
                 .code_signature_flags
                 .clone()
                 .into_iter()
-                .filter_map(|(key, value)| key_map(key).map(|key| (key, value)))
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::CodeSignatureFlags, key).map(|key| (key, value))
+                })
                 .collect::<BTreeMap<_, _>>(),
             runtime_version: self
                 .runtime_version
                 .clone()
                 .into_iter()
-                .filter_map(|(key, value)| key_map(key).map(|key| (key, value)))
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::RuntimeVersion, key).map(|key| (key, value))
+                })
                 .collect::<BTreeMap<_, _>>(),
             info_plist_data: self
                 .info_plist_data
                 .clone()
                 .into_iter()
-                .filter_map(|(key, value)| key_map(key).map(|key| (key, value)))
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::InfoPlist, key).map(|key| (key, value))
+                })
                 .collect::<BTreeMap<_, _>>(),
             code_resources_data: self
                 .code_resources_data
                 .clone()
                 .into_iter()
-                .filter_map(|(key, value)| key_map(key).map(|key| (key, value)))
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::CodeResources, key).map(|key| (key, value))
+                })
                 .collect::<BTreeMap<_, _>>(),
             extra_digests: self
                 .extra_digests
                 .clone()
                 .into_iter()
-                .filter_map(|(key, value)| key_map(key).map(|key| (key, value)))
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::ExtraDigests, key).map(|key| (key, value))
+                })
                 .collect::<BTreeMap<_, _>>(),
+            launch_constraints_self: self
+                .launch_constraints_self
+                .clone()
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::LaunchConstraintsSelf, key).map(|key| (key, value))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            launch_constraints_parent: self
+                .launch_constraints_parent
+                .clone()
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::LaunchConstraintsParent, key).map(|key| (key, value))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            launch_constraints_responsible: self
+                .launch_constraints_responsible
+                .clone()
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::LaunchConstraintsResponsible, key)
+                        .map(|key| (key, value))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            library_constraints: self
+                .library_constraints
+                .clone()
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    key_map(ScopedSetting::LibraryConstraints, key).map(|key| (key, value))
+                })
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    /// Attempt to validate the settings consistency when the `for notarization` flag is set.
+    ///
+    /// On error, logs errors at error level and returns an Err.
+    pub fn ensure_for_notarization_settings(&self) -> Result<(), AppleCodesignError> {
+        if !self.for_notarization {
+            return Ok(());
+        }
+
+        let mut have_error = false;
+
+        if let Some((_, cert)) = self.signing_key() {
+            if !cert.chains_to_apple_root_ca() && !cert.is_test_apple_signed_certificate() {
+                error!("--for-notarization requires use of an Apple-issued signing certificate; current certificate is not signed by Apple");
+                error!("hint: use a signing certificate issued by Apple that is signed by an Apple certificate authority");
+                have_error = true;
+            }
+
+            if !cert.apple_code_signing_extensions().into_iter().any(|e| {
+                e == CodeSigningCertificateExtension::DeveloperIdApplication
+                    || e == CodeSigningCertificateExtension::DeveloperIdInstaller
+                    || e == CodeSigningCertificateExtension::DeveloperIdKernel {}
+            }) {
+                error!("--for-notarization requires use of a Developer ID signing certificate; current certificate doesn't appear to be such a certificate");
+                error!("hint: use a `Developer ID Application`, `Developer ID Installer`, or `Developer ID Kernel` certificate");
+                have_error = true;
+            }
+
+            if self.time_stamp_url().is_none() {
+                error!("--for-notarization requires use of a time-stamp protocol server; none configured");
+                have_error = true;
+            }
+        } else {
+            error!("--for-notarization requires use of a Developer ID signing certificate; no signing certificate was provided");
+            have_error = true;
+        }
+
+        if have_error {
+            Err(AppleCodesignError::ForNotarizationInvalidSettings)
+        } else {
+            Ok(())
         }
     }
 }
@@ -1084,7 +1523,7 @@ mod tests {
             b"cpu_x86_64".to_vec(),
         );
 
-        let macho_settings = main_settings.as_nested_macho_settings(0, CPU_TYPE_ARM64);
+        let macho_settings = main_settings.as_universal_macho_settings(0, CPU_TYPE_ARM64);
         assert_eq!(
             macho_settings.binary_identifier(SettingsScope::Main),
             Some("ident")
@@ -1098,7 +1537,7 @@ mod tests {
             Some(b"index_0".as_ref())
         );
 
-        let macho_settings = main_settings.as_nested_macho_settings(0, CPU_TYPE_X86_64);
+        let macho_settings = main_settings.as_universal_macho_settings(0, CPU_TYPE_X86_64);
         assert_eq!(
             macho_settings.binary_identifier(SettingsScope::Main),
             Some("ident")
@@ -1243,6 +1682,26 @@ mod tests {
 
         let s = settings.entitlements_xml(SettingsScope::Main)?;
         assert_eq!(s, Some("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>application-identifier</key>\n\t<string>appid</string>\n\t<key>com.apple.developer.team-identifier</key>\n\t<string>ABCDEF</string>\n</dict>\n</plist>".into()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn for_notarization_handling() -> Result<(), AppleCodesignError> {
+        let mut settings = SigningSettings::default();
+        settings.set_for_notarization(true);
+
+        assert_eq!(
+            settings.code_signature_flags(SettingsScope::Main),
+            Some(CodeSignatureFlags::RUNTIME)
+        );
+
+        assert_eq!(
+            settings
+                .as_bundle_macho_settings("")
+                .code_signature_flags(SettingsScope::Main),
+            Some(CodeSignatureFlags::RUNTIME)
+        );
 
         Ok(())
     }

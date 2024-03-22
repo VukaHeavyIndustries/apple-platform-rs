@@ -9,8 +9,11 @@ use {
         remote_signing::{session_negotiation::PublicKeyPeerDecrypt, RemoteSignError},
         AppleCodesignError,
     },
+    apple_xar::table_of_contents::ChecksumType as XarChecksumType,
     bytes::Bytes,
+    clap::ValueEnum,
     der::{asn1, Decode, Document, Encode, SecretDocument},
+    digest::DynDigest,
     elliptic_curve::{
         sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint},
         AffinePoint, Curve, CurveArithmetic, FieldBytesSize, SecretKey as ECSecretKey,
@@ -21,17 +24,20 @@ use {
     p256::NistP256,
     pkcs1::RsaPrivateKey,
     pkcs8::{EncodePrivateKey, ObjectIdentifier, PrivateKeyInfo},
-    ring::signature::{EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair},
-    rsa::{
-        algorithms::mgf1_xor, pkcs1::DecodeRsaPrivateKey, BigUint, Oaep,
-        RsaPrivateKey as RsaConstructedKey,
-    },
+    ring::signature::{Ed25519KeyPair, KeyPair},
+    rsa::{pkcs1::DecodeRsaPrivateKey, BigUint, Oaep, RsaPrivateKey as RsaConstructedKey},
     signature::Signer,
     spki::AlgorithmIdentifier,
+    std::{
+        borrow::Cow,
+        cmp::Ordering,
+        fmt::{Display, Formatter},
+        path::Path,
+    },
     subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption},
     x509_certificate::{
-        CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, KeyInfoSigner,
-        Sign, Signature, SignatureAlgorithm, X509CertificateError,
+        CapturedX509Certificate, DigestAlgorithm, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm,
+        KeyInfoSigner, Sign, Signature, SignatureAlgorithm, X509CertificateError,
     },
     zeroize::Zeroizing,
 };
@@ -92,19 +98,24 @@ impl TryFrom<InMemoryRsaKey> for InMemorySigningKeyPair {
     type Error = AppleCodesignError;
 
     fn try_from(value: InMemoryRsaKey) -> Result<Self, Self::Error> {
-        let key_pair = RsaKeyPair::from_der(value.private_key.as_bytes()).map_err(|e| {
-            AppleCodesignError::CertificateGeneric(format!("error importing RSA key to ring: {e}"))
-        })?;
-
-        Ok(InMemorySigningKeyPair::Rsa(
-            key_pair,
-            value.private_key.as_bytes().to_vec(),
-        ))
+        Ok(Self::from_pkcs8_der(
+            value
+                .to_pkcs8_der()
+                .map_err(|e| {
+                    AppleCodesignError::CertificateGeneric(format!(
+                        "error converting RSA key to DER: {}",
+                        e
+                    ))
+                })?
+                .as_bytes(),
+        )?)
     }
 }
 
 impl EncodePrivateKey for InMemoryRsaKey {
     fn to_pkcs8_der(&self) -> pkcs8::Result<SecretDocument> {
+        // We don't need to store the public key because it can always be
+        // derived from the private key for RSA keys.
         let raw = PrivateKeyInfo::new(pkcs1::ALGORITHM_ID, self.private_key.as_bytes()).to_der()?;
 
         Ok(Document::from_der(&raw)?.into_secret())
@@ -163,23 +174,16 @@ where
     type Error = AppleCodesignError;
 
     fn try_from(key: InMemoryEcdsaKey<C>) -> Result<Self, Self::Error> {
-        let curve = key.curve()?;
-
-        let private_key = key.secret_key.to_bytes();
-        let public_key = key.secret_key.public_key().to_encoded_point(false);
-
-        let key_pair = EcdsaKeyPair::from_private_key_and_public_key(
-            curve.into(),
-            private_key.as_ref(),
-            public_key.as_bytes(),
-        )
-        .map_err(|e| {
-            AppleCodesignError::CertificateGeneric(format!(
-                "unable to convert ECDSA private key: {e}"
-            ))
-        })?;
-
-        Ok(Self::Ecdsa(key_pair, curve, vec![]))
+        Ok(Self::from_pkcs8_der(
+            key.to_pkcs8_der()
+                .map_err(|e| {
+                    AppleCodesignError::CertificateGeneric(format!(
+                        "error converting ECDSA key to DER: {}",
+                        e
+                    ))
+                })?
+                .as_bytes(),
+        )?)
     }
 }
 
@@ -227,14 +231,16 @@ impl TryFrom<InMemoryEd25519Key> for InMemorySigningKeyPair {
     type Error = AppleCodesignError;
 
     fn try_from(key: InMemoryEd25519Key) -> Result<Self, Self::Error> {
-        let key_pair =
-            Ed25519KeyPair::from_seed_unchecked(key.private_key.as_ref()).map_err(|e| {
-                AppleCodesignError::CertificateGeneric(format!(
-                    "unable to convert ED25519 private key: {e}"
-                ))
-            })?;
-
-        Ok(Self::Ed25519(key_pair))
+        Ok(Self::from_pkcs8_der(
+            key.to_pkcs8_der()
+                .map_err(|e| {
+                    AppleCodesignError::CertificateGeneric(format!(
+                        "error converting ED25519 key to DER: {}",
+                        e
+                    ))
+                })?
+                .as_bytes(),
+        )?)
     }
 }
 
@@ -248,7 +254,18 @@ impl EncodePrivateKey for InMemoryEd25519Key {
         let key_ref: &[u8] = self.private_key.as_ref();
         let value = Zeroizing::new(asn1::OctetString::new(key_ref)?.to_der()?);
 
-        PrivateKeyInfo::new(algorithm, value.as_ref()).try_into()
+        let mut pki = PrivateKeyInfo::new(algorithm, value.as_ref());
+
+        let public_key =
+            if let Ok(key) = Ed25519KeyPair::from_seed_unchecked(self.private_key.as_ref()) {
+                Bytes::copy_from_slice(key.public_key().as_ref())
+            } else {
+                Bytes::new()
+            };
+
+        pki.public_key = Some(public_key.as_ref());
+
+        pki.try_into()
     }
 }
 
@@ -387,21 +404,23 @@ impl Sign for InMemoryPrivateKey {
         })
     }
 
-    fn private_key_data(&self) -> Option<Vec<u8>> {
+    fn private_key_data(&self) -> Option<Zeroizing<Vec<u8>>> {
         match self {
-            Self::EcdsaP256(key) => Some(key.secret_key.to_bytes().to_vec()),
-            Self::Ed25519(key) => Some((*key.private_key).clone()),
-            Self::Rsa(key) => Some(key.private_key.as_bytes().to_vec()),
+            Self::EcdsaP256(key) => Some(Zeroizing::new(key.secret_key.to_bytes().to_vec())),
+            Self::Ed25519(key) => Some(Zeroizing::new((*key.private_key).clone())),
+            Self::Rsa(key) => Some(Zeroizing::new(key.private_key.as_bytes().to_vec())),
         }
     }
 
-    fn rsa_primes(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, X509CertificateError> {
+    fn rsa_primes(
+        &self,
+    ) -> Result<Option<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)>, X509CertificateError> {
         if let Self::Rsa(key) = self {
             let key = key.rsa_private_key();
 
             Ok(Some((
-                key.prime1.as_bytes().to_vec(),
-                key.prime2.as_bytes().to_vec(),
+                Zeroizing::new(key.prime1.as_bytes().to_vec()),
+                Zeroizing::new(key.prime2.as_bytes().to_vec()),
             )))
         } else {
             Ok(None)
@@ -458,6 +477,213 @@ impl InMemoryPrivateKey {
                 "when converting parsed PKCS#8 to a private key: {e}"
             ))
         })
+    }
+}
+
+/// Represents a digest type encountered in code signature data structures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DigestType {
+    None,
+    Sha1,
+    Sha256,
+    Sha256Truncated,
+    Sha384,
+    Sha512,
+    #[value(skip)]
+    Unknown(u8),
+}
+
+impl Default for DigestType {
+    fn default() -> Self {
+        Self::Sha256
+    }
+}
+
+impl TryFrom<DigestType> for DigestAlgorithm {
+    type Error = AppleCodesignError;
+
+    fn try_from(value: DigestType) -> Result<DigestAlgorithm, Self::Error> {
+        match value {
+            DigestType::Sha1 => Ok(DigestAlgorithm::Sha1),
+            DigestType::Sha256 => Ok(DigestAlgorithm::Sha256),
+            DigestType::Sha256Truncated => Ok(DigestAlgorithm::Sha256),
+            DigestType::Sha384 => Ok(DigestAlgorithm::Sha384),
+            DigestType::Sha512 => Ok(DigestAlgorithm::Sha512),
+            DigestType::Unknown(_) => Err(AppleCodesignError::DigestUnknownAlgorithm),
+            DigestType::None => Err(AppleCodesignError::DigestUnsupportedAlgorithm),
+        }
+    }
+}
+
+impl PartialOrd for DigestType {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DigestType {
+    fn cmp(&self, other: &Self) -> Ordering {
+        u8::from(*self).cmp(&u8::from(*other))
+    }
+}
+
+impl Display for DigestType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DigestType::None => f.write_str("none"),
+            DigestType::Sha1 => f.write_str("sha1"),
+            DigestType::Sha256 => f.write_str("sha256"),
+            DigestType::Sha256Truncated => f.write_str("sha256-truncated"),
+            DigestType::Sha384 => f.write_str("sha384"),
+            DigestType::Sha512 => f.write_str("sha512"),
+            DigestType::Unknown(v) => f.write_fmt(format_args!("unknown: {v}")),
+        }
+    }
+}
+
+impl TryFrom<&str> for DigestType {
+    type Error = AppleCodesignError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "none" => Ok(Self::None),
+            "sha1" => Ok(Self::Sha1),
+            "sha256" => Ok(Self::Sha256),
+            "sha256-truncated" => Ok(Self::Sha256Truncated),
+            "sha384" => Ok(Self::Sha384),
+            "sha512" => Ok(Self::Sha512),
+            _ => Err(AppleCodesignError::DigestUnknownAlgorithm),
+        }
+    }
+}
+
+impl TryFrom<XarChecksumType> for DigestType {
+    type Error = AppleCodesignError;
+
+    fn try_from(c: XarChecksumType) -> Result<Self, Self::Error> {
+        match c {
+            XarChecksumType::None => Ok(Self::None),
+            XarChecksumType::Sha1 => Ok(Self::Sha1),
+            XarChecksumType::Sha256 => Ok(Self::Sha256),
+            XarChecksumType::Sha512 => Ok(Self::Sha512),
+            XarChecksumType::Md5 => Err(AppleCodesignError::DigestUnsupportedAlgorithm),
+        }
+    }
+}
+
+impl DigestType {
+    /// Obtain the size of hashes for this hash type.
+    pub fn hash_len(&self) -> Result<usize, AppleCodesignError> {
+        Ok(self.digest_data(&[])?.len())
+    }
+
+    /// Obtain a hasher for this digest type.
+    pub fn as_hasher(&self) -> Result<ring::digest::Context, AppleCodesignError> {
+        match self {
+            Self::None => Err(AppleCodesignError::DigestUnknownAlgorithm),
+            Self::Sha1 => Ok(ring::digest::Context::new(
+                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+            )),
+            Self::Sha256 | Self::Sha256Truncated => {
+                Ok(ring::digest::Context::new(&ring::digest::SHA256))
+            }
+            Self::Sha384 => Ok(ring::digest::Context::new(&ring::digest::SHA384)),
+            Self::Sha512 => Ok(ring::digest::Context::new(&ring::digest::SHA512)),
+            Self::Unknown(_) => Err(AppleCodesignError::DigestUnknownAlgorithm),
+        }
+    }
+
+    /// Digest data given the configured hasher.
+    pub fn digest_data(&self, data: &[u8]) -> Result<Vec<u8>, AppleCodesignError> {
+        let mut hasher = self.as_hasher()?;
+
+        hasher.update(data);
+        let mut hash = hasher.finish().as_ref().to_vec();
+
+        if matches!(self, Self::Sha256Truncated) {
+            hash.truncate(20);
+        }
+
+        Ok(hash)
+    }
+}
+
+pub struct Digest<'a> {
+    pub data: Cow<'a, [u8]>,
+}
+
+impl<'a> Digest<'a> {
+    /// Whether this is the null hash (all 0s).
+    pub fn is_null(&self) -> bool {
+        self.data.iter().all(|b| *b == 0)
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.data.to_vec()
+    }
+
+    pub fn to_owned(&self) -> Digest<'static> {
+        Digest {
+            data: Cow::Owned(self.data.clone().into_owned()),
+        }
+    }
+
+    pub fn as_hex(&self) -> String {
+        hex::encode(&self.data)
+    }
+}
+
+impl<'a> std::fmt::Debug for Digest<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&hex::encode(&self.data))
+    }
+}
+
+impl<'a> From<Vec<u8>> for Digest<'a> {
+    fn from(v: Vec<u8>) -> Self {
+        Self { data: v.into() }
+    }
+}
+
+/// Holds multiple computed digests for content.
+pub struct MultiDigest {
+    pub sha1: Digest<'static>,
+    pub sha256: Digest<'static>,
+}
+
+impl MultiDigest {
+    /// Compute the multi digests for any stream reader.
+    ///
+    /// This will read the stream until EOF.
+    pub fn from_reader(mut reader: impl std::io::Read) -> Result<Self, AppleCodesignError> {
+        let mut sha1 = DigestType::Sha1.as_hasher()?;
+        let mut sha256 = DigestType::Sha256.as_hasher()?;
+
+        let mut buffer = [0u8; 16384];
+
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+
+            sha1.update(&buffer[0..read]);
+            sha256.update(&buffer[0..read]);
+        }
+
+        let sha1 = sha1.finish().as_ref().to_vec();
+        let sha256 = sha256.finish().as_ref().to_vec();
+
+        Ok(Self {
+            sha1: sha1.into(),
+            sha256: sha256.into(),
+        })
+    }
+
+    /// Compute the multi digest of a filesystem path.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, AppleCodesignError> {
+        let fh = std::fs::File::open(path.as_ref())?;
+        Self::from_reader(fh)
     }
 }
 
@@ -662,9 +888,51 @@ pub(crate) fn rsa_oaep_post_decrypt_decode(
     Ok(out[index as usize..].to_vec())
 }
 
+fn inc_counter(counter: &mut [u8; 4]) {
+    for i in (0..4).rev() {
+        counter[i] = counter[i].wrapping_add(1);
+        if counter[i] != 0 {
+            // No overflow
+            return;
+        }
+    }
+}
+
+fn mgf1_xor(out: &mut [u8], digest: &mut dyn DynDigest, seed: &[u8]) {
+    let mut counter = [0u8; 4];
+    let mut i = 0;
+
+    const MAX_LEN: u64 = core::u32::MAX as u64 + 1;
+    assert!(out.len() as u64 <= MAX_LEN);
+
+    while i < out.len() {
+        let mut digest_input = vec![0u8; seed.len() + 4];
+        digest_input[0..seed.len()].copy_from_slice(seed);
+        digest_input[seed.len()..].copy_from_slice(&counter);
+
+        digest.update(digest_input.as_slice());
+        let digest_output = &*digest.finalize_reset();
+        let mut j = 0;
+        loop {
+            if j >= digest_output.len() || i >= out.len() {
+                break;
+            }
+
+            out[i] ^= digest_output[j];
+            j += 1;
+            i += 1;
+        }
+        inc_counter(&mut counter);
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use {super::*, ring::signature::KeyPair, x509_certificate::Sign};
+    use {
+        super::*,
+        ring::signature::{EcdsaKeyPair, KeyPair, RsaKeyPair},
+        x509_certificate::Sign,
+    };
 
     const RSA_2048_PKCS8_DER: &[u8] = include_bytes!("testdata/rsa-2048.pk8");
     const ED25519_PKCS8_DER: &[u8] = include_bytes!("testdata/ed25519.pk8");
@@ -697,6 +965,10 @@ mod test {
 
         InMemoryPrivateKey::from_pkcs8_der(RSA_2048_PKCS8_DER)?;
 
+        let random_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let random_key_pkcs8 = random_key.to_pkcs8_der().unwrap();
+        InMemorySigningKeyPair::from_pkcs8_der(random_key_pkcs8.as_bytes())?;
+
         Ok(())
     }
 
@@ -706,7 +978,13 @@ mod test {
         let seed = &pki.private_key[2..];
         let key = InMemoryPrivateKey::try_from(pki).unwrap();
 
-        assert_eq!(key.to_pkcs8_der().unwrap().as_bytes(), ED25519_PKCS8_DER);
+        assert!(
+            InMemorySigningKeyPair::from_pkcs8_der(ED25519_PKCS8_DER).is_err(),
+            "stored key doesn't have public key, which ring rejects loading"
+        );
+
+        // But out PKCS#8 export includes it so it can round trip.
+        InMemorySigningKeyPair::from_pkcs8_der(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
 
         let our_key = InMemorySigningKeyPair::try_from(key)?;
         let our_public_key = our_key.public_key_data();
@@ -726,6 +1004,7 @@ mod test {
         let ring_key = EcdsaKeyPair::from_pkcs8(
             &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             SECP256_PKCS8_DER,
+            &ring::rand::SystemRandom::new(),
         )
         .unwrap();
         let ring_public_key_data = ring_key.public_key().as_ref();
@@ -735,6 +1014,7 @@ mod test {
 
         assert_eq!(key.to_pkcs8_der().unwrap().as_bytes(), SECP256_PKCS8_DER);
 
+        InMemorySigningKeyPair::from_pkcs8_der(SECP256_PKCS8_DER)?;
         let our_key = InMemorySigningKeyPair::try_from(key)?;
         let our_public_key = our_key.public_key_data();
 

@@ -129,10 +129,12 @@ pub use embedded_signature::*;
 pub mod embedded_signature_builder;
 pub use embedded_signature_builder::*;
 pub mod entitlements;
+pub mod environment_constraints;
 mod error;
 pub use error::*;
 mod macho;
 pub use macho::*;
+pub mod macho_builder;
 #[cfg(target_os = "macos")]
 #[allow(non_upper_case_globals)]
 mod macos;
@@ -146,6 +148,7 @@ pub use macho_universal::UniversalBinaryBuilder;
 pub mod notarization;
 #[cfg(feature = "notarize")]
 pub use notarization::*;
+pub mod plist_der;
 mod policy;
 pub use policy::*;
 mod reader;
@@ -160,5 +163,7 @@ pub mod stapling;
 pub mod ticket_lookup;
 mod verify;
 pub use verify::*;
+#[cfg(target_os = "windows")]
+pub mod windows;
 #[cfg(feature = "yubikey")]
 pub mod yubikey;

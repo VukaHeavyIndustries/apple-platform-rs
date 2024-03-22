@@ -3,6 +3,8 @@ default:
 
 exe_suffix := if os() == "windows" { ".exe" } else { "" }
 
+tar := if os() == "macos" { "gtar" } else { "tar" }
+
 macosx_deployment_target := if os() == "macos" {
   if arch() == "arm" {
     "11.0"
@@ -63,14 +65,12 @@ assemble-exe-artifacts exe commit dest:
 
 _codesign-exe in_path:
   rcodesign sign \
-    --remote-signer \
     --remote-public-key-pem-file ci/developer-id-application.pem \
     --code-signature-flags runtime \
     {{in_path}}
 
 _codesign in_path out_path:
   rcodesign sign \
-    --remote-signer \
     --remote-public-key-pem-file ci/developer-id-application.pem \
     {{in_path}} {{out_path}}
 
@@ -83,7 +83,7 @@ notarize path:
     {{path}}
 
 _tar_directory source_directory dir_name dest_dir:
-  tar \
+  {{tar}} \
     --sort=name \
     --owner=root:0 \
     --group=root:0 \
@@ -103,9 +103,8 @@ _zip_directory source_directory dir_name dest_dir:
 
 _release_universal_binary project tag exe:
   mkdir -p dist/{{project}}-stage/{{project}}-{{tag}}-macos-universal
-  llvm-lipo-14 \
-    -create \
-    -output dist/{{project}}-stage/{{project}}-{{tag}}-macos-universal/{{exe}} \
+  rcodesign macho-universal-create \
+    --output dist/{{project}}-stage/{{project}}-{{tag}}-macos-universal/{{exe}} \
     dist/{{project}}-stage/{{project}}-{{tag}}-aarch64-apple-darwin/{{exe}} \
     dist/{{project}}-stage/{{project}}-{{tag}}-x86_64-apple-darwin/{{exe}}
   cp dist/{{project}}-stage/{{project}}-{{tag}}-aarch64-apple-darwin/COPYING \

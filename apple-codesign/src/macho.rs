@@ -14,11 +14,8 @@ data.
 
 use {
     crate::{
-        embedded_signature::{DigestType, EmbeddedSignature},
-        error::AppleCodesignError,
-        signing_settings::{SettingsScope, SigningSettings},
+        cryptography::DigestType, embedded_signature::EmbeddedSignature, error::AppleCodesignError,
     },
-    cryptographic_message_syntax::time_stamp_message_http,
     goblin::mach::{
         constants::{SEG_LINKEDIT, SEG_TEXT},
         header::MH_EXECUTE,
@@ -31,7 +28,6 @@ use {
     },
     rayon::prelude::*,
     scroll::Pread,
-    x509_certificate::DigestAlgorithm,
 };
 
 /// A Mach-O binary.
@@ -62,6 +58,35 @@ impl<'a> MachOBinary<'a> {
 }
 
 impl<'a> MachOBinary<'a> {
+    /// Find the __LINKEDIT segment and its segment index.
+    pub fn linkedit_index_and_segment(&self) -> Option<(usize, &Segment<'a>)> {
+        self.macho
+            .segments
+            .iter()
+            .enumerate()
+            .find(|(_, segment)| matches!(segment.name(), Ok(SEG_LINKEDIT)))
+    }
+
+    /// Find the __LINKEDIT segment.
+    pub fn linkedit_segment(&self) -> Option<&Segment<'a>> {
+        self.linkedit_index_and_segment().map(|(_, x)| x)
+    }
+
+    /// Find the __LINKEDIT segment, asserting it exists and it is the final segment.
+    pub fn linkedit_segment_assert_last(&self) -> Result<&Segment<'a>, AppleCodesignError> {
+        let last_segment = self
+            .segments_by_file_offset()
+            .last()
+            .copied()
+            .ok_or(AppleCodesignError::MissingLinkedit)?;
+
+        if !matches!(last_segment.name(), Ok(SEG_LINKEDIT)) {
+            Err(AppleCodesignError::LinkeditNotLast)
+        } else {
+            Ok(last_segment)
+        }
+    }
+
     /// Attempt to extract a reference to raw signature data in a Mach-O binary.
     ///
     /// An `LC_CODE_SIGNATURE` load command in the Mach-O file header points to
@@ -72,50 +97,33 @@ impl<'a> MachOBinary<'a> {
     pub fn find_signature_data(
         &self,
     ) -> Result<Option<MachOSignatureData<'a>>, AppleCodesignError> {
-        if let Some(linkedit_data_command) =
-            self.macho.load_commands.iter().find_map(|load_command| {
-                if let CommandVariant::CodeSignature(command) = &load_command.command {
-                    Some(command)
-                } else {
-                    None
-                }
-            })
-        {
+        if let Some(linkedit_data_command) = self.code_signature_load_command() {
             // Now find the slice of data in the __LINKEDIT segment we need to parse.
             let (linkedit_segment_index, linkedit) = self
-                .macho
-                .segments
-                .iter()
-                .enumerate()
-                .find(|(_, segment)| {
-                    if let Ok(name) = segment.name() {
-                        name == SEG_LINKEDIT
-                    } else {
-                        false
-                    }
-                })
+                .linkedit_index_and_segment()
                 .ok_or(AppleCodesignError::MissingLinkedit)?;
 
             let linkedit_segment_start_offset = linkedit.fileoff as usize;
             let linkedit_segment_end_offset = linkedit_segment_start_offset + linkedit.data.len();
-            let linkedit_signature_start_offset = linkedit_data_command.dataoff as usize;
-            let linkedit_signature_end_offset =
-                linkedit_signature_start_offset + linkedit_data_command.datasize as usize;
-            let signature_start_offset =
+            let signature_file_start_offset = linkedit_data_command.dataoff as usize;
+            let signature_file_end_offset =
+                signature_file_start_offset + linkedit_data_command.datasize as usize;
+            let signature_segment_start_offset =
                 linkedit_data_command.dataoff as usize - linkedit.fileoff as usize;
-            let signature_end_offset =
-                signature_start_offset + linkedit_data_command.datasize as usize;
+            let signature_segment_end_offset =
+                signature_segment_start_offset + linkedit_data_command.datasize as usize;
 
-            let signature_data = &linkedit.data[signature_start_offset..signature_end_offset];
+            let signature_data =
+                &linkedit.data[signature_segment_start_offset..signature_segment_end_offset];
 
             Ok(Some(MachOSignatureData {
                 linkedit_segment_index,
                 linkedit_segment_start_offset,
                 linkedit_segment_end_offset,
-                linkedit_signature_start_offset,
-                linkedit_signature_end_offset,
-                signature_start_offset,
-                signature_end_offset,
+                signature_file_start_offset,
+                signature_file_end_offset,
+                signature_segment_start_offset,
+                signature_segment_end_offset,
                 linkedit_segment_data: linkedit.data,
                 signature_data,
             }))
@@ -157,11 +165,7 @@ impl<'a> MachOBinary<'a> {
 
     /// The start offset of the code signature data within the __LINKEDIT segment.
     pub fn code_signature_linkedit_start_offset(&self) -> Option<u32> {
-        let segment = self
-            .macho
-            .segments
-            .iter()
-            .find(|segment| matches!(segment.name(), Ok(SEG_LINKEDIT)));
+        let segment = self.linkedit_segment();
 
         if let (Some(segment), Some(command)) = (segment, self.code_signature_load_command()) {
             Some((command.dataoff as u64 - segment.fileoff) as u32)
@@ -195,15 +199,7 @@ impl<'a> MachOBinary<'a> {
     /// If a signature is present, this is the offset of the start of the
     /// signature. Else it represents the end of the binary.
     pub fn code_limit_binary_offset(&self) -> Result<u64, AppleCodesignError> {
-        let last_segment = self
-            .segments_by_file_offset()
-            .last()
-            .copied()
-            .ok_or(AppleCodesignError::MissingLinkedit)?;
-
-        if !matches!(last_segment.name(), Ok(SEG_LINKEDIT)) {
-            return Err(AppleCodesignError::LinkeditNotLast);
-        }
+        let last_segment = self.linkedit_segment_assert_last()?;
 
         if let Some(offset) = self.code_signature_linkedit_start_offset() {
             Ok(last_segment.fileoff + offset as u64)
@@ -216,11 +212,7 @@ impl<'a> MachOBinary<'a> {
     ///
     /// If there is no signature, returns all the data for the __LINKEDIT segment.
     pub fn linkedit_data_before_signature(&self) -> Option<&[u8]> {
-        let segment = self
-            .macho
-            .segments
-            .iter()
-            .find(|segment| matches!(segment.name(), Ok(SEG_LINKEDIT)));
+        let segment = self.linkedit_segment();
 
         if let Some(segment) = segment {
             if let Some(offset) = self.code_signature_linkedit_start_offset() {
@@ -316,16 +308,7 @@ impl<'a> MachOBinary<'a> {
     /// signature containing just the code directory (without a cryptographically
     /// signed signature), so this limitation hopefully isn't impactful.
     pub fn check_signing_capability(&self) -> Result<(), AppleCodesignError> {
-        let last_segment = self
-            .segments_by_file_offset()
-            .last()
-            .copied()
-            .ok_or(AppleCodesignError::MissingLinkedit)?;
-
-        // Last segment needs to be __LINKEDIT so we don't have to write offsets.
-        if !matches!(last_segment.name(), Ok(SEG_LINKEDIT)) {
-            return Err(AppleCodesignError::LinkeditNotLast);
-        }
+        let last_segment = self.linkedit_segment_assert_last()?;
 
         // Rules:
         //
@@ -372,74 +355,6 @@ impl<'a> MachOBinary<'a> {
                 Err(AppleCodesignError::LoadCommandNoRoom)
             }
         }
-    }
-
-    /// Estimate the size in bytes of an embedded code signature.
-    pub fn estimate_embedded_signature_size(
-        &self,
-        settings: &SigningSettings,
-    ) -> Result<usize, AppleCodesignError> {
-        let code_directory_count = 1 + settings
-            .extra_digests(SettingsScope::Main)
-            .map(|x| x.len())
-            .unwrap_or_default();
-
-        // Assume the common data structures are 1024 bytes.
-        let mut size = 1024 * code_directory_count;
-
-        // Reserve room for the code digests, which are proportional to binary size.
-        // We could avoid doing the actual digesting work here. But until people
-        // complain, don't worry about it.
-        size += self.code_digests_size(*settings.digest_type(), 4096)?;
-
-        if let Some(digests) = settings.extra_digests(SettingsScope::Main) {
-            for digest in digests {
-                size += self.code_digests_size(*digest, 4096)?;
-            }
-        }
-
-        // Assume the CMS data will take a fixed size.
-        if settings.signing_key().is_some() {
-            size += 4096;
-        }
-
-        // Long certificate chains could blow up the size. Account for those.
-        for cert in settings.certificate_chain() {
-            size += cert.constructed_data().len();
-        }
-
-        // Add entitlements xml if needed.
-        if let Some(entitlements) = settings.entitlements_xml(SettingsScope::Main)? {
-            size += entitlements.as_bytes().len()
-        }
-
-        // Obtain an actual timestamp token of placeholder data and use its length.
-        // This may be excessive to actually query the time-stamp server and issue
-        // a token. But these operations should be "cheap."
-        if let Some(timestamp_url) = settings.time_stamp_url() {
-            let message = b"deadbeef".repeat(32);
-
-            if let Ok(response) =
-                time_stamp_message_http(timestamp_url.clone(), &message, DigestAlgorithm::Sha256)
-            {
-                if response.is_success() {
-                    if let Some(l) = response.token_content_size() {
-                        size += l;
-                    } else {
-                        size += 8192;
-                    }
-                } else {
-                    size += 8192;
-                }
-            } else {
-                size += 8192;
-            }
-        }
-
-        // Align on 1k boundaries just because.
-        size += 1024 - size % 1024;
-
-        Ok(size)
     }
 
     /// Attempt to resolve the mach-o targeting settings.
@@ -496,16 +411,16 @@ pub struct MachOSignatureData<'a> {
     pub linkedit_segment_end_offset: usize,
 
     /// Start offset of signature data in `__LINKEDIT` within the binary.
-    pub linkedit_signature_start_offset: usize,
+    pub signature_file_start_offset: usize,
 
     /// End offset of signature data in `__LINKEDIT` within the binary.
-    pub linkedit_signature_end_offset: usize,
+    pub signature_file_end_offset: usize,
 
     /// The start offset of the signature data within the `__LINKEDIT` segment.
-    pub signature_start_offset: usize,
+    pub signature_segment_start_offset: usize,
 
     /// The end offset of the signature data within the `__LINKEDIT` segment.
-    pub signature_end_offset: usize,
+    pub signature_segment_end_offset: usize,
 
     /// Raw data in the `__LINKEDIT` segment.
     pub linkedit_segment_data: &'a [u8],
@@ -538,6 +453,7 @@ pub struct BuildVersionCommand {
 }
 
 /// Represents `PLATFORM_` mach-o constants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Platform {
     MacOs,
     IOs,
@@ -588,6 +504,24 @@ impl From<u32> for Platform {
     }
 }
 
+impl From<Platform> for u32 {
+    fn from(val: Platform) -> Self {
+        match val {
+            Platform::MacOs => 1,
+            Platform::IOs => 2,
+            Platform::TvOs => 3,
+            Platform::WatchOs => 4,
+            Platform::BridgeOs => 5,
+            Platform::MacCatalyst => 6,
+            Platform::IosSimulator => 7,
+            Platform::TvOsSimulator => 8,
+            Platform::WatchOsSimulator => 9,
+            Platform::DriverKit => 10,
+            Platform::Unknown(v) => v,
+        }
+    }
+}
+
 impl Platform {
     /// Resolve SHA-256 digest/signatures support for a given platform type.
     pub fn sha256_digest_support(&self) -> Result<semver::VersionReq, AppleCodesignError> {
@@ -616,6 +550,28 @@ pub struct MachoTarget {
     pub minimum_os_version: semver::Version,
     /// SDK version targeting.
     pub sdk_version: semver::Version,
+}
+
+impl MachoTarget {
+    /// Convert the instance to a LC_BUILD_VERSION load command.
+    pub fn to_build_version_command_vec(&self, endian: object::Endianness) -> Vec<u8> {
+        let command = object::macho::BuildVersionCommand {
+            cmd: object::U32::new(endian, object::macho::LC_BUILD_VERSION),
+            cmdsize: object::U32::new(
+                endian,
+                std::mem::size_of::<object::macho::BuildVersionCommand<object::Endianness>>() as _,
+            ),
+            platform: object::U32::new(endian, self.platform.into()),
+            minos: object::U32::new(
+                endian,
+                semver_to_macho_target_version(&self.minimum_os_version),
+            ),
+            sdk: object::U32::new(endian, semver_to_macho_target_version(&self.sdk_version)),
+            ntools: object::U32::new(endian, 0),
+        };
+
+        object::bytes_of(&command).to_vec()
+    }
 }
 
 /// Parses and integer with nibbles xxxx.yy.zz into a [semver::Version].
@@ -818,7 +774,12 @@ mod tests {
                         }
                     }
                     Ok(None) => {
-                        panic!("this shouln't happen (validated signature data is present");
+                        // This has been observed to occur in the wild. But not from Apple
+                        // signed binaries. Mostly ignore it.
+                        eprintln!(
+                            "{} has a signature blob without CMS data; weird",
+                            path.display()
+                        );
                     }
                     Err(e) => {
                         println!("error performing CMS parse of {}: {:?}", path.display(), e);

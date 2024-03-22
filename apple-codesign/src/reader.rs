@@ -8,10 +8,11 @@ use {
     crate::{
         certificate::AppleCertificate,
         code_directory::CodeDirectoryBlob,
+        cryptography::DigestType,
         dmg::{path_is_dmg, DmgReader},
-        embedded_signature::{BlobEntry, DigestType, EmbeddedSignature},
+        embedded_signature::{BlobEntry, EmbeddedSignature},
         embedded_signature_builder::{CD_DIGESTS_OID, CD_DIGESTS_PLIST_OID},
-        error::AppleCodesignError,
+        error::{AppleCodesignError, Result},
         macho::{MachFile, MachOBinary},
     },
     apple_bundles::{DirectoryBundle, DirectoryBundleFile},
@@ -52,10 +53,12 @@ impl MachOType {
 
         let magic = goblin::mach::peek(&header, 0)?;
 
-        match magic {
-            FAT_MAGIC => Ok(Some(Self::Mach)),
-            _ if parse_magic_and_ctx(&header, 0).is_ok() => Ok(Some(Self::MachO)),
-            _ => Ok(None),
+        if magic == FAT_MAGIC {
+            Ok(Some(Self::Mach))
+        } else if let Ok((_, Some(_))) = parse_magic_and_ctx(&header, 0) {
+            Ok(Some(Self::MachO))
+        } else {
+            Ok(None)
         }
     }
 }
@@ -88,9 +91,15 @@ pub fn path_is_zip(path: impl AsRef<Path>) -> Result<bool, AppleCodesignError> {
     }
 }
 
+/// Whether the specified filesystem path is a Mach-O binary.
+pub fn path_is_macho(path: impl AsRef<Path>) -> Result<bool, AppleCodesignError> {
+    Ok(MachOType::from_path(path)?.is_some())
+}
+
 /// Describes the type of entity at a path.
 ///
 /// This represents a best guess.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathType {
     MachO,
     Dmg,
@@ -107,23 +116,26 @@ impl PathType {
 
         if path.is_file() {
             if path_is_dmg(path)? {
-                Ok(PathType::Dmg)
+                Ok(Self::Dmg)
             } else if path_is_xar(path)? {
-                Ok(PathType::Xar)
+                Ok(Self::Xar)
             } else if path_is_zip(path)? {
-                Ok(PathType::Zip)
+                Ok(Self::Zip)
+            } else if path_is_macho(path)? {
+                Ok(Self::MachO)
             } else {
-                match MachOType::from_path(path)? {
-                    Some(MachOType::Mach | MachOType::MachO) => Ok(Self::MachO),
-                    None => Ok(Self::Other),
-                }
+                Ok(Self::Other)
             }
         } else if path.is_dir() {
-            Ok(PathType::Bundle)
+            Ok(Self::Bundle)
         } else {
-            Ok(PathType::Other)
+            Ok(Self::Other)
         }
     }
+}
+
+fn format_integer<T: std::fmt::Display + std::fmt::LowerHex>(v: T) -> String {
+    format!("{} / 0x{:x}", v, v)
 }
 
 fn pretty_print_xml(xml: &[u8]) -> Result<Vec<u8>, AppleCodesignError> {
@@ -151,6 +163,14 @@ fn pretty_print_xml(xml: &[u8]) -> Result<Vec<u8>, AppleCodesignError> {
     })?;
 
     Ok(xml)
+}
+
+/// Pretty print XML and turn into a Vec of lines.
+fn pretty_print_xml_lines(xml: &[u8]) -> Result<Vec<String>> {
+    Ok(String::from_utf8_lossy(pretty_print_xml(xml)?.as_ref())
+        .lines()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -195,8 +215,8 @@ pub struct CertificateInfo {
     pub is_apple_root_ca: bool,
     pub is_apple_intermediate_ca: bool,
     pub chains_to_apple_root_ca: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub apple_ca_extension: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub apple_ca_extensions: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub apple_extended_key_usages: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -226,7 +246,11 @@ impl TryFrom<&CapturedX509Certificate> for CertificateInfo {
             is_apple_root_ca: cert.is_apple_root_ca(),
             is_apple_intermediate_ca: cert.is_apple_intermediate_ca(),
             chains_to_apple_root_ca: cert.chains_to_apple_root_ca(),
-            apple_ca_extension: cert.apple_ca_extension().map(|x| x.to_string()),
+            apple_ca_extensions: cert
+                .apple_ca_extensions()
+                .into_iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>(),
             apple_extended_key_usages: cert
                 .apple_extended_key_usage_purposes()
                 .into_iter()
@@ -300,10 +324,7 @@ impl CmsSigner {
                             })
                             .map_err(|e| AppleCodesignError::Cms(e.into()))?;
 
-                        cdhash_plist = String::from_utf8_lossy(&pretty_print_xml(&plist)?)
-                            .lines()
-                            .map(|x| x.to_string())
-                            .collect::<Vec<_>>();
+                        cdhash_plist = pretty_print_xml_lines(&plist)?;
                     }
                 } else if attr.typ == CD_DIGESTS_OID {
                     for value in &attr.values {
@@ -316,10 +337,8 @@ impl CmsSigner {
                                     let oid = bcder::Oid::take_from(cons)?;
                                     let value = bcder::OctetString::take_from(cons)?;
 
-                                    cdhash_digests.push((
-                                        format!("{oid}"),
-                                        hex::encode(value.into_bytes()),
-                                    ));
+                                    cdhash_digests
+                                        .push((format!("{oid}"), hex::encode(value.into_bytes())));
 
                                     Ok(())
                                 })?;
@@ -456,14 +475,25 @@ impl<'a> TryFrom<CodeDirectoryBlob<'a>> for CodeDirectory {
 #[derive(Clone, Debug, Serialize)]
 pub struct CodeSignature {
     /// Length of the code signature data.
-    pub superblob_length: u32,
+    pub superblob_length: String,
     pub blob_count: u32,
     pub blobs: Vec<BlobDescription>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_directory: Option<CodeDirectory>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub alternative_code_directories: Vec<(String, CodeDirectory)>,
-    pub entitlements_plist: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entitlements_plist: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entitlements_der_plist: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub launch_constraints_self: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub launch_constraints_parent: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub launch_constraints_responsible: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub library_constraints: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub code_requirements: Vec<String>,
     pub cms: Option<CmsSignature>,
@@ -473,7 +503,12 @@ impl<'a> TryFrom<EmbeddedSignature<'a>> for CodeSignature {
     type Error = AppleCodesignError;
 
     fn try_from(sig: EmbeddedSignature<'a>) -> Result<Self, Self::Error> {
-        let mut entitlements_plist = None;
+        let mut entitlements_plist = vec![];
+        let mut entitlements_der_plist = vec![];
+        let mut launch_constraints_self = vec![];
+        let mut launch_constraints_parent = vec![];
+        let mut launch_constraints_responsible = vec![];
+        let mut library_constraints = vec![];
         let mut code_requirements = vec![];
         let mut cms = None;
 
@@ -490,7 +525,33 @@ impl<'a> TryFrom<EmbeddedSignature<'a>> for CodeSignature {
             .collect::<Result<Vec<_>, AppleCodesignError>>()?;
 
         if let Some(blob) = sig.entitlements()? {
-            entitlements_plist = Some(blob.as_str().to_string());
+            entitlements_plist = blob
+                .as_str()
+                .lines()
+                .map(|x| x.replace('\t', "  "))
+                .collect::<Vec<_>>();
+        }
+
+        if let Some(blob) = sig.entitlements_der()? {
+            let xml = blob.plist_xml()?;
+
+            entitlements_der_plist = pretty_print_xml_lines(&xml)?;
+        }
+
+        if let Some(blob) = sig.launch_constraints_self()? {
+            launch_constraints_self = pretty_print_xml_lines(&blob.plist_xml()?)?;
+        }
+
+        if let Some(blob) = sig.launch_constraints_parent()? {
+            launch_constraints_parent = pretty_print_xml_lines(&blob.plist_xml()?)?;
+        }
+
+        if let Some(blob) = sig.launch_constraints_responsible()? {
+            launch_constraints_responsible = pretty_print_xml_lines(&blob.plist_xml()?)?;
+        }
+
+        if let Some(blob) = sig.library_constraints()? {
+            library_constraints = pretty_print_xml_lines(&blob.plist_xml()?)?;
         }
 
         if let Some(req) = sig.code_requirements()? {
@@ -514,7 +575,7 @@ impl<'a> TryFrom<EmbeddedSignature<'a>> for CodeSignature {
         }
 
         Ok(Self {
-            superblob_length: sig.length,
+            superblob_length: format_integer(sig.length),
             blob_count: sig.count,
             blobs: sig
                 .blobs
@@ -524,6 +585,11 @@ impl<'a> TryFrom<EmbeddedSignature<'a>> for CodeSignature {
             code_directory,
             alternative_code_directories,
             entitlements_plist,
+            entitlements_der_plist,
+            launch_constraints_self,
+            launch_constraints_parent,
+            launch_constraints_responsible,
+            library_constraints,
             code_requirements,
             cms,
         })
@@ -532,12 +598,14 @@ impl<'a> TryFrom<EmbeddedSignature<'a>> for CodeSignature {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct MachOEntity {
-    pub linkedit_segment_file_start_offset: Option<usize>,
-    pub linkedit_segment_file_end_offset: Option<usize>,
-    pub signature_file_start_offset: Option<usize>,
-    pub signature_file_end_offset: Option<usize>,
-    pub signature_linkedit_start_offset: Option<usize>,
-    pub signature_linkedit_end_offset: Option<usize>,
+    pub macho_linkedit_start_offset: Option<String>,
+    pub macho_signature_start_offset: Option<String>,
+    pub macho_signature_end_offset: Option<String>,
+    pub macho_linkedit_end_offset: Option<String>,
+    pub macho_end_offset: Option<String>,
+    pub linkedit_signature_start_offset: Option<String>,
+    pub linkedit_signature_end_offset: Option<String>,
+    pub linkedit_bytes_after_signature: Option<String>,
     pub signature: Option<CodeSignature>,
 }
 
@@ -624,10 +692,7 @@ impl XarTableOfContents {
         let checksum_size = toc.checksum.size;
 
         // This can be useful for debugging.
-        //let xml = String::from_utf8_lossy(&pretty_print_xml(&xml)?)
-        //    .lines()
-        //    .map(|x| x.to_string())
-        //    .collect::<Vec<_>>();
+        //let xml = pretty_print_xml_lines(&xml)?;
         let xml = vec![];
 
         Ok(Self {
@@ -762,6 +827,7 @@ pub struct FileEntity {
     pub symlink_target: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_path: Option<String>,
+    #[serde(with = "serde_yaml::with::singleton_map")]
     pub entity: SignatureEntity,
 }
 
@@ -888,16 +954,35 @@ impl SignatureReader {
     fn resolve_macho_entity(macho: MachOBinary) -> Result<MachOEntity, AppleCodesignError> {
         let mut entity = MachOEntity::default();
 
+        entity.macho_end_offset = Some(format_integer(macho.data.len()));
+
         if let Some(sig) = macho.find_signature_data()? {
-            entity.linkedit_segment_file_start_offset = Some(sig.linkedit_segment_start_offset);
-            entity.linkedit_segment_file_end_offset = Some(sig.linkedit_segment_end_offset);
-            entity.signature_file_start_offset = Some(sig.linkedit_signature_start_offset);
-            entity.signature_file_end_offset = Some(sig.linkedit_signature_end_offset);
-            entity.signature_linkedit_start_offset = Some(sig.signature_start_offset);
-            entity.signature_linkedit_end_offset = Some(sig.signature_end_offset);
+            entity.macho_linkedit_start_offset =
+                Some(format_integer(sig.linkedit_segment_start_offset));
+            entity.macho_linkedit_end_offset =
+                Some(format_integer(sig.linkedit_segment_end_offset));
+            entity.macho_signature_start_offset =
+                Some(format_integer(sig.signature_file_start_offset));
+            entity.linkedit_signature_start_offset =
+                Some(format_integer(sig.signature_segment_start_offset));
         }
 
         if let Some(sig) = macho.code_signature()? {
+            if let Some(sig_info) = macho.find_signature_data()? {
+                entity.macho_signature_end_offset = Some(format_integer(
+                    sig_info.signature_file_start_offset + sig.length as usize,
+                ));
+                entity.linkedit_signature_end_offset = Some(format_integer(
+                    sig_info.signature_segment_start_offset + sig.length as usize,
+                ));
+
+                let mut linkedit_remaining =
+                    sig_info.linkedit_segment_end_offset - sig_info.linkedit_segment_start_offset;
+                linkedit_remaining -= sig_info.signature_segment_start_offset;
+                linkedit_remaining -= sig.length as usize;
+                entity.linkedit_bytes_after_signature = Some(format_integer(linkedit_remaining));
+            }
+
             entity.signature = Some(sig.try_into()?);
         }
 

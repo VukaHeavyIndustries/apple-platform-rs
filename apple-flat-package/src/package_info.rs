@@ -14,7 +14,7 @@ use {
 ///
 /// This includes authentication requirements, behavior after installation, etc.
 /// See the fields for more descriptions.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PackageInfo {
     /// Authentication requirements for the package install.
@@ -108,7 +108,7 @@ pub struct PackageInfo {
 
     /// Scripts to run before and after install.
     #[serde(default)]
-    pub scripts: Vec<Script>,
+    pub scripts: Scripts,
 
     #[serde(default)]
     pub strict_identifiers: Vec<BundleRef>,
@@ -145,7 +145,7 @@ impl Default for PackageInfo {
             patch: vec![],
             payload: None,
             relocate: vec![],
-            scripts: vec![],
+            scripts: Default::default(),
             strict_identifiers: vec![],
             update_bundle: vec![],
             upgrade_bundle: vec![],
@@ -171,7 +171,7 @@ impl PackageInfo {
 }
 
 /// File record.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct File {
     /// File path.
@@ -184,7 +184,7 @@ pub struct File {
     pub sha1: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Payload {
     #[serde(rename = "numberOfFiles")]
     pub number_of_files: u64,
@@ -192,13 +192,20 @@ pub struct Payload {
     pub install_kbytes: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct BundleRef {
     pub id: Option<String>,
 }
 
+/// Wrapper type to represent <scripts>.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Scripts {
+    #[serde(rename = "$value")]
+    pub scripts: Vec<Script>,
+}
+
 /// An entry in <scripts>.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum Script {
     #[serde(rename = "preinstall")]
     PreInstall(PreInstall),
@@ -208,7 +215,7 @@ pub enum Script {
 }
 
 /// A script to run before install.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct PreInstall {
     /// Name of script to run.
     pub file: String,
@@ -218,11 +225,52 @@ pub struct PreInstall {
 }
 
 /// A script to run after install.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct PostInstall {
     /// Name of script to run.
     pub file: String,
 
     /// ID of bundle element to run after.
     pub component_id: Option<String>,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn scripts_decode() {
+        const INPUT: &str = r#"
+            <?xml version="1.0" encoding="utf-8"?>
+            <pkg-info overwrite-permissions="true" relocatable="false" identifier="my-app" postinstall-action="none" version="1" format-version="2" generator-version="InstallCmds-807 (21D62)" install-location="/usr/bin/my-app" auth="root">
+                <payload numberOfFiles="123" installKBytes="123"/>
+                <bundle-version/>
+                <upgrade-bundle/>
+                <update-bundle/>
+                <atomic-update-bundle/>
+                <strict-identifier/>
+                <relocate/>
+                <scripts>
+                    <preinstall file="./preinstall"/>
+                    <postinstall file="./postinstall"/>
+                </scripts>
+            </pkg-info>
+        "#;
+
+        let info = PackageInfo::from_xml(INPUT.trim()).unwrap();
+
+        assert_eq!(
+            info.scripts.scripts,
+            vec![
+                Script::PreInstall(PreInstall {
+                    file: "./preinstall".into(),
+                    component_id: None,
+                }),
+                Script::PostInstall(PostInstall {
+                    file: "./postinstall".into(),
+                    component_id: None,
+                })
+            ]
+        );
+    }
 }

@@ -8,15 +8,17 @@ use {
     crate::{
         code_directory::CodeDirectoryBlob,
         code_requirement::{CodeRequirementExpression, RequirementType},
-        code_resources::{CodeResourcesBuilder, CodeResourcesRule},
-        embedded_signature::{Blob, BlobData, DigestType},
+        code_resources::{normalized_resources_path, CodeResourcesBuilder, CodeResourcesRule},
+        cryptography::DigestType,
+        embedded_signature::{Blob, BlobData},
         error::AppleCodesignError,
         macho::MachFile,
         macho_signing::{write_macho_file, MachOSigner},
+        signing::path_identifier,
         signing_settings::{SettingsScope, SigningSettings},
     },
-    apple_bundles::{BundlePackageType, DirectoryBundle, DirectoryBundleFile},
-    log::{info, warn},
+    apple_bundles::{BundlePackageType, DirectoryBundle},
+    log::{debug, info, warn},
     simple_file_manifest::create_symlink,
     std::{
         borrow::Cow,
@@ -27,10 +29,14 @@ use {
 };
 
 /// Copy a bundle's contents to a destination directory.
+///
+/// This does not use the CodeResources rules for a bundle. Rather, it
+/// blindly copies all files in the bundle. This means that excluded files
+/// can be copied.
 pub fn copy_bundle(bundle: &DirectoryBundle, dest_dir: &Path) -> Result<(), AppleCodesignError> {
     let settings = SigningSettings::default();
 
-    let handler = SingleBundleHandler {
+    let context = BundleSigningContext {
         dest_dir: dest_dir.to_path_buf(),
         settings: &settings,
     };
@@ -39,7 +45,7 @@ pub fn copy_bundle(bundle: &DirectoryBundle, dest_dir: &Path) -> Result<(), Appl
         .files(false)
         .map_err(AppleCodesignError::DirectoryBundle)?
     {
-        handler.install_file(&file)?;
+        context.install_file(file.absolute_path(), file.relative_path())?;
     }
 
     Ok(())
@@ -64,17 +70,82 @@ impl BundleSigner {
     pub fn new_from_path(path: impl AsRef<Path>) -> Result<Self, AppleCodesignError> {
         let main_bundle = DirectoryBundle::new_from_path(path.as_ref())
             .map_err(AppleCodesignError::DirectoryBundle)?;
+        let root_bundle_path = main_bundle.root_dir().to_path_buf();
 
-        let mut bundles = main_bundle
-            .nested_bundles(true)
-            .map_err(AppleCodesignError::DirectoryBundle)?
-            .into_iter()
-            .map(|(k, bundle)| (Some(k), SingleBundleSigner::new(bundle)))
-            .collect::<BTreeMap<Option<String>, SingleBundleSigner>>();
+        let mut bundles = BTreeMap::default();
 
-        bundles.insert(None, SingleBundleSigner::new(main_bundle));
+        bundles.insert(None, SingleBundleSigner::new(root_bundle_path, main_bundle));
 
         Ok(Self { bundles })
+    }
+
+    /// Find bundles in subdirectories of the main bundle and mark them for signing.
+    pub fn collect_nested_bundles(&mut self) -> Result<(), AppleCodesignError> {
+        let (root_bundle_path, nested) = {
+            let main = self.bundles.get(&None).expect("main bundle should exist");
+
+            let nested = main
+                .bundle
+                .nested_bundles(true)
+                .map_err(AppleCodesignError::DirectoryBundle)?;
+
+            (main.root_bundle_path.clone(), nested)
+        };
+
+        self.bundles.extend(
+        nested.into_iter()
+            .filter(|(k, bundle)| {
+                // Our bundle classifier is very aggressive about annotating directories
+                // as bundles. Pretty much anything with an Info.plist can get through.
+                // We apply additional filtering here so we only emit bundles that can
+                // be signed.
+                //
+                // A better solution here is to use the CodeResources rule
+                // based file walker to look for directories with the "nested" flag.
+                // If a bundle-looking directory exists outside of a "nested" rule,
+                // it probably shouldn't be signed.
+
+                let (has_package_type, has_signable_package_type) = if let Ok(Some(pt)) = bundle.info_plist_key_string("CFBundlePackageType") {
+                    (true, pt != "dSYM")
+                } else {
+                    (false, false)
+                };
+
+                let has_bundle_identifier = matches!(bundle.info_plist_key_string("CFBundleIdentifier"), Ok(Some(_)));
+
+                match (has_package_type, has_signable_package_type, has_bundle_identifier)  {
+                    (true, false, _) =>{
+                        debug!("{k} discarded because its CFBundlePackageType is not signable");
+                        false
+                    }
+                    (true, _, true) => {
+                        // It quacks like a bundle.
+                        true
+                    }
+                    (false, _, false) => {
+                        // This looks like a naked Info.plist.
+                        debug!("{k} discarded as a signable bundle because its Info.plist lacks CFBundlePackageType and CFBundleIdentifier");
+                        false
+                    }
+                    (true, _, false) => {
+                        info!("{k} has an Info.plist with a CFBundlePackageType but not a CFBundleIdentifier; we'll try to sign it but we recommend adding a CFBundleIdentifier");
+                        true
+                    }
+                    (false, _, true) => {
+                        info!("{k} has an Info.plist with a CFBundleIdentifier but without a CFBundlePackageType; we'll try to sign it but we recommend adding a CFBundlePackageType");
+                        true
+                    }
+                }
+            })
+            .map(|(k, bundle)| {
+                (
+                    Some(k),
+                    SingleBundleSigner::new(root_bundle_path.clone(), bundle),
+                )
+            })
+        );
+
+        Ok(())
     }
 
     /// Write a signed bundle to the given destination directory.
@@ -101,27 +172,29 @@ impl BundleSigner {
         // should be deterministic.
         bundles.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()));
 
-        warn!(
-            "signing {} nested bundles in the following order:",
-            bundles.len()
-        );
-        for bundle in &bundles {
-            warn!("{}", bundle.0);
+        if !bundles.is_empty() {
+            if settings.shallow() {
+                warn!("{} nested bundles will be copied instead of signed because shallow signing enabled:", bundles.len());
+            } else {
+                warn!(
+                    "signing {} nested bundles in the following order:",
+                    bundles.len()
+                );
+            }
+            for bundle in &bundles {
+                warn!("{}", bundle.0);
+            }
         }
 
         for (rel, nested) in bundles {
             let nested_dest_dir = dest_dir.join(rel);
-            info!(
-                "entering nested bundle {}",
-                nested.bundle.root_dir().display(),
-            );
+            warn!("entering nested bundle {}", rel,);
 
-            // If we excluded this bundle from signing, just copy all the files.
-            if settings
-                .path_exclusion_patterns()
-                .iter()
-                .any(|pattern| pattern.matches(rel))
-            {
+            if settings.shallow() {
+                warn!("shallow signing enabled; bundle will be copied instead of signed");
+                copy_bundle(&nested.bundle, &nested_dest_dir)?;
+            } else if settings.path_exclusion_pattern_matches(rel) {
+                // If we excluded this bundle from signing, just copy all the files.
                 warn!("bundle is in exclusion list; it will be copied instead of signed");
                 copy_bundle(&nested.bundle, &nested_dest_dir)?;
             } else {
@@ -131,10 +204,7 @@ impl BundleSigner {
                 )?;
             }
 
-            info!(
-                "leaving nested bundle {}",
-                nested.bundle.root_dir().display()
-            );
+            warn!("leaving nested bundle {}", rel);
         }
 
         let main = self
@@ -190,29 +260,36 @@ impl SignedMachOInfo {
                 // In case no explicit requirements has been set, we use current file cdhashes.
                 let mut requirement_expr = None;
 
+                // We record the 20 byte digests of every code directory in every
+                // Mach-O.
+                // Note: Apple's tooling appears to always record the x86-64 Mach-O
+                // first, even if it isn't first in the universal binary. Since we're
+                // dealing with a bunch of OR'd code requirements expressions, we don't
+                // believe this difference is worth caring about.
                 for macho in mach.iter_macho() {
-                    let cd = macho
+                    for (_, cd) in macho
                         .code_signature()?
                         .ok_or(AppleCodesignError::BinaryNoCodeSignature)?
-                        .preferred_code_directory()?;
+                        .all_code_directories()?
+                    {
+                        let digest_type = if cd.digest_type == DigestType::Sha256 {
+                            DigestType::Sha256Truncated
+                        } else {
+                            cd.digest_type
+                        };
 
-                    let digest_type = if cd.digest_type == DigestType::Sha256 {
-                        DigestType::Sha256Truncated
-                    } else {
-                        cd.digest_type
-                    };
+                        let digest = digest_type.digest_data(&cd.to_blob_bytes()?)?;
+                        let expression = Box::new(CodeRequirementExpression::CodeDirectoryHash(
+                            Cow::from(digest),
+                        ));
 
-                    let digest = digest_type.digest_data(&cd.to_blob_bytes()?)?;
-                    let expression = Box::new(CodeRequirementExpression::CodeDirectoryHash(
-                        Cow::from(digest),
-                    ));
-
-                    if let Some(left_part) = requirement_expr {
-                        requirement_expr = Some(Box::new(CodeRequirementExpression::Or(
-                            left_part, expression,
-                        )))
-                    } else {
-                        requirement_expr = Some(expression);
+                        if let Some(left_part) = requirement_expr {
+                            requirement_expr = Some(Box::new(CodeRequirementExpression::Or(
+                                left_part, expression,
+                            )))
+                        } else {
+                            requirement_expr = Some(expression);
+                        }
                     }
                 }
 
@@ -260,48 +337,40 @@ impl SignedMachOInfo {
     }
 }
 
-/// Used to process individual files within a bundle.
-///
-/// This abstraction lets entities like [CodeResourcesBuilder] drive the
-/// installation of files into a new bundle.
-pub trait BundleFileHandler {
-    /// Ensures a file (regular or symlink) is installed.
-    fn install_file(&self, file: &DirectoryBundleFile) -> Result<(), AppleCodesignError>;
+/// Holds state and helper methods to facilitate signing a bundle.
+pub struct BundleSigningContext<'a, 'key> {
+    /// Settings for this bundle.
+    pub settings: &'a SigningSettings<'key>,
+    /// Where the bundle is getting installed to.
+    pub dest_dir: PathBuf,
+}
 
-    /// Sign a Mach-O file and ensure its new content is installed.
-    ///
-    /// Returns Mach-O metadata which will be recorded in
-    /// [crate::code_resources::CodeResources].
-    fn sign_and_install_macho(
+impl<'a, 'key> BundleSigningContext<'a, 'key> {
+    /// Install a file (regular or symlink) in the destination directory.
+    pub fn install_file(
         &self,
-        file: &DirectoryBundleFile,
-    ) -> Result<SignedMachOInfo, AppleCodesignError>;
-}
-
-struct SingleBundleHandler<'a, 'key> {
-    settings: &'a SigningSettings<'key>,
-    dest_dir: PathBuf,
-}
-
-impl<'a, 'key> BundleFileHandler for SingleBundleHandler<'a, 'key> {
-    fn install_file(&self, file: &DirectoryBundleFile) -> Result<(), AppleCodesignError> {
-        let source_path = file.absolute_path();
-        let dest_path = self.dest_dir.join(file.relative_path());
+        source_path: &Path,
+        dest_rel_path: &Path,
+    ) -> Result<PathBuf, AppleCodesignError> {
+        let dest_path = self.dest_dir.join(dest_rel_path);
 
         if source_path != dest_path {
-            std::fs::create_dir_all(
-                dest_path
-                    .parent()
-                    .expect("parent directory should be available"),
-            )?;
+            // Remove an existing file before installing the replacement. In
+            // the case of symlinks this is required due to how symlink creation
+            // works.
+            if dest_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(&dest_path)?;
+            }
+
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
 
             let metadata = source_path.symlink_metadata()?;
             let mtime = filetime::FileTime::from_last_modification_time(&metadata);
 
-            if let Some(target) = file
-                .symlink_target()
-                .map_err(AppleCodesignError::DirectoryBundle)?
-            {
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(source_path)?;
                 info!(
                     "replicating symlink {} -> {}",
                     dest_path.display(),
@@ -319,59 +388,56 @@ impl<'a, 'key> BundleFileHandler for SingleBundleHandler<'a, 'key> {
                     source_path.display(),
                     dest_path.display()
                 );
+                // TODO consider stripping XATTR_RESOURCEFORK_NAME and XATTR_FINDERINFO_NAME.
                 std::fs::copy(source_path, &dest_path)?;
                 filetime::set_file_mtime(&dest_path, mtime)?;
             }
         }
 
-        Ok(())
+        Ok(dest_path)
     }
 
-    fn sign_and_install_macho(
-        &self,
-        file: &DirectoryBundleFile,
-    ) -> Result<SignedMachOInfo, AppleCodesignError> {
-        info!("signing Mach-O file {}", file.relative_path().display());
+    /// Sign a Mach-O file and ensure its new content is installed.
+    ///
+    /// Returns Mach-O metadata which can be recorded in a CodeResources file.
 
-        let macho_data = std::fs::read(file.absolute_path())?;
+    pub fn sign_and_install_macho(
+        &self,
+        source_path: &Path,
+        dest_rel_path: &Path,
+    ) -> Result<(PathBuf, SignedMachOInfo), AppleCodesignError> {
+        warn!("signing Mach-O file {}", dest_rel_path.display());
+
+        let macho_data = std::fs::read(source_path)?;
         let signer = MachOSigner::new(&macho_data)?;
 
         let mut settings = self
             .settings
-            .as_bundle_macho_settings(file.relative_path().to_string_lossy().as_ref());
+            .as_bundle_macho_settings(dest_rel_path.to_string_lossy().as_ref());
+
+        // When signing a Mach-O in the context of a bundle, always define the
+        // binary identifier from the filename so everything is consistent.
+        // Unless an existing setting overrides it, of course.
+        if settings.binary_identifier(SettingsScope::Main).is_none() {
+            let identifier = path_identifier(dest_rel_path)?;
+            info!("setting binary identifier based on path: {}", identifier);
+
+            settings.set_binary_identifier(SettingsScope::Main, &identifier);
+        }
 
         settings.import_settings_from_macho(&macho_data)?;
-
-        // If there isn't a defined binary identifier, derive one from the file name so one is set
-        // and we avoid a signing error due to missing identifier.
-        // TODO do we need to check the nested Mach-O settings?
-        if settings.binary_identifier(SettingsScope::Main).is_none() {
-            let identifier = file
-                .relative_path()
-                .file_name()
-                .expect("failure to extract filename (this should never happen)")
-                .to_string_lossy();
-
-            let identifier = identifier
-                .strip_suffix(".dylib")
-                .unwrap_or_else(|| identifier.as_ref());
-
-            info!(
-                "Mach-O is missing binary identifier; setting to {} based on file name",
-                identifier
-            );
-            settings.set_binary_identifier(SettingsScope::Main, identifier);
-        }
 
         let mut new_data = Vec::<u8>::with_capacity(macho_data.len() + 2_usize.pow(17));
         signer.write_signed_binary(&settings, &mut new_data)?;
 
-        let dest_path = self.dest_dir.join(file.relative_path());
+        let dest_path = self.dest_dir.join(dest_rel_path);
 
         info!("writing Mach-O to {}", dest_path.display());
-        write_macho_file(file.absolute_path(), &dest_path, &new_data)?;
+        write_macho_file(source_path, &dest_path, &new_data)?;
 
-        SignedMachOInfo::parse_data(&new_data)
+        let info = SignedMachOInfo::parse_data(&new_data)?;
+
+        Ok((dest_path, info))
     }
 }
 
@@ -382,14 +448,20 @@ impl<'a, 'key> BundleFileHandler for SingleBundleHandler<'a, 'key> {
 /// for signing bundles, as failure to account for nested bundles can result in
 /// signature verification errors.
 pub struct SingleBundleSigner {
+    /// Path of the root bundle being signed.
+    root_bundle_path: PathBuf,
+
     /// The bundle being signed.
     bundle: DirectoryBundle,
 }
 
 impl SingleBundleSigner {
     /// Construct a new instance.
-    pub fn new(bundle: DirectoryBundle) -> Self {
-        Self { bundle }
+    pub fn new(root_bundle_path: PathBuf, bundle: DirectoryBundle) -> Self {
+        Self {
+            root_bundle_path,
+            bundle,
+        }
     }
 
     /// Write a signed bundle to the given directory.
@@ -422,12 +494,12 @@ impl SingleBundleSigner {
         // a valid framework warranting signing.
         if self.bundle.package_type() == BundlePackageType::Framework {
             if self.bundle.root_dir().join("Versions").is_dir() {
-                warn!("found a versioned framework; each version will be signed as its own bundle");
+                info!("found a versioned framework; each version will be signed as its own bundle");
 
                 // But we still need to preserve files (hopefully just symlinks) outside the
                 // nested bundles under `Versions/`. Since we don't nest into child bundles
                 // here, it should be safe to handle each encountered file.
-                let handler = SingleBundleHandler {
+                let context = BundleSigningContext {
                     dest_dir: dest_dir.to_path_buf(),
                     settings,
                 };
@@ -437,13 +509,13 @@ impl SingleBundleSigner {
                     .files(false)
                     .map_err(AppleCodesignError::DirectoryBundle)?
                 {
-                    handler.install_file(&file)?;
+                    context.install_file(file.absolute_path(), file.relative_path())?;
                 }
 
                 return DirectoryBundle::new_from_path(dest_dir)
                     .map_err(AppleCodesignError::DirectoryBundle);
             } else {
-                warn!("found an unversioned framework; signing like normal");
+                info!("found an unversioned framework; signing like normal");
             }
         }
 
@@ -477,21 +549,27 @@ impl SingleBundleSigner {
             let mach = MachFile::parse(&macho_data)?;
 
             for macho in mach.iter_macho() {
-                if let Some(targeting) = macho.find_targeting()? {
+                let need_sha1_sha256 = if let Some(targeting) = macho.find_targeting()? {
                     let sha256_version = targeting.platform.sha256_digest_support()?;
 
-                    if !sha256_version.matches(&targeting.minimum_os_version)
-                        && resources_digests != vec![DigestType::Sha1, DigestType::Sha256]
-                    {
-                        info!("main executable targets OS requiring SHA-1 signatures; activating SHA-1 + SHA-256 signing");
-                        resources_digests = vec![DigestType::Sha1, DigestType::Sha256];
-                        break;
-                    }
+                    !sha256_version.matches(&targeting.minimum_os_version)
+                } else {
+                    true
+                };
+
+                if need_sha1_sha256
+                    && resources_digests != vec![DigestType::Sha1, DigestType::Sha256]
+                {
+                    info!(
+                        "activating SHA-1 + SHA-256 signing due to requirements of main executable"
+                    );
+                    resources_digests = vec![DigestType::Sha1, DigestType::Sha256];
+                    break;
                 }
             }
         }
 
-        warn!("collecting code resources files");
+        info!("collecting code resources files");
 
         // The set of rules to use is determined by whether the bundle *can* have a
         // `Resources/`, not whether it necessarily does. The exact rules for this are not
@@ -515,71 +593,40 @@ impl SingleBundleSigner {
         resources_builder.add_exclusion_rule(CodeResourcesRule::new("^_CodeSignature/")?.exclude());
         // Ignore notarization ticket.
         resources_builder.add_exclusion_rule(CodeResourcesRule::new("^CodeResources$")?.exclude());
+        // Ignore store manifest directory.
+        resources_builder.add_exclusion_rule(CodeResourcesRule::new("^_MASReceipt$")?.exclude());
 
-        let handler = SingleBundleHandler {
+        // The bundle's main executable file's code directory needs to hold a
+        // digest of the CodeResources file for the bundle. Therefore it needs to
+        // be handled last. We add an exclusion rule to prevent the directory walker
+        // from touching this file.
+        if let Some(main_exe) = &main_exe {
+            // Also seal the resources normalized path, just in case it is different.
+            resources_builder.add_exclusion_rule(
+                CodeResourcesRule::new(format!(
+                    "^{}$",
+                    regex::escape(&normalized_resources_path(main_exe.relative_path()))
+                ))?
+                .exclude(),
+            );
+        }
+
+        let context = BundleSigningContext {
             dest_dir: dest_dir_root.clone(),
             settings,
         };
 
-        let mut info_plist_data = None;
+        resources_builder.walk_and_seal_directory(
+            &self.root_bundle_path,
+            self.bundle.root_dir(),
+            &context,
+        )?;
 
-        // Iterate files in this bundle and register as code resources.
-        //
-        // Traversing into nested bundles seems wrong but it is correct. The resources builder
-        // has rules to determine whether to process a path and assuming the rules and evaluation
-        // of them is correct, it is able to decide for itself how to handle a path.
-        //
-        // Furthermore, this behavior is needed as bundles can encapsulate signatures for nested
-        // bundles. For example, you could have a framework bundle with an embedded app bundle in
-        // `Resources/MyApp.app`! In this case, the framework's CodeResources encapsulates the
-        // content of `Resources/My.app` per the processing rules.
-        for file in self
-            .bundle
-            .files(true)
-            .map_err(AppleCodesignError::DirectoryBundle)?
-        {
-            // The main executable is special and handled below.
-            if file
-                .is_main_executable()
-                .map_err(AppleCodesignError::DirectoryBundle)?
-            {
-                continue;
-            } else if file.is_info_plist() {
-                // The Info.plist is digested specially. But it may also be handled by
-                // the resources handler. So always feed it through.
-                info!(
-                    "{} is the Info.plist file; handling specially",
-                    file.relative_path().display()
-                );
-                resources_builder.process_file(&file, &handler)?;
-                info_plist_data = Some(std::fs::read(file.absolute_path())?);
-            } else {
-                resources_builder.process_file(&file, &handler)?;
-            }
-        }
-
-        // Seal code directory digests of any nested bundles.
-        //
-        // Apple's tooling seems to only do this for some bundle type combinations. I'm
-        // not yet sure what the complete heuristic is. But we observed that frameworks
-        // don't appear to include digests of any nested app bundles. So we add that
-        // exclusion. iOS bundles don't seem to include digests for nested bundles either.
-        // We should figure out what the actual rules here...
-        if !self.bundle.shallow() {
-            let dest_bundle = DirectoryBundle::new_from_path(&dest_dir)
-                .map_err(AppleCodesignError::DirectoryBundle)?;
-
-            for (rel_path, nested_bundle) in dest_bundle
-                .nested_bundles(false)
-                .map_err(AppleCodesignError::DirectoryBundle)?
-            {
-                resources_builder.process_nested_bundle(&rel_path, &nested_bundle)?;
-            }
-        }
+        let info_plist_data = std::fs::read(self.bundle.info_plist_path())?;
 
         // The resources are now sealed. Write out that XML file.
         let code_resources_path = dest_dir.join("_CodeSignature").join("CodeResources");
-        warn!(
+        info!(
             "writing sealed resources to {}",
             code_resources_path.display()
         );
@@ -599,7 +646,8 @@ impl SingleBundleSigner {
             let macho_data = std::fs::read(exe.absolute_path())?;
             let signer = MachOSigner::new(&macho_data)?;
 
-            let mut settings = settings.clone();
+            let mut settings = settings
+                .as_bundle_main_executable_settings(exe.relative_path().to_string_lossy().as_ref());
 
             // The identifier for the main executable is defined in the bundle's Info.plist.
             if let Some(ident) = self
@@ -613,13 +661,14 @@ impl SingleBundleSigner {
                 info!("unable to determine binary identifier from bundle's Info.plist (CFBundleIdentifier not set?)");
             }
 
-            settings.import_settings_from_macho(&macho_data)?;
-
             settings.set_code_resources_data(SettingsScope::Main, resources_data);
+            settings.set_info_plist_data(SettingsScope::Main, info_plist_data);
 
-            if let Some(info_plist_data) = info_plist_data {
-                settings.set_info_plist_data(SettingsScope::Main, info_plist_data);
-            }
+            // Important: manually override all settings before calling this so that
+            // explicitly set settings are always used and we don't get misleading logs.
+            // If we set settings after the fact, we may fail to define settings on a
+            // sub-scope, leading the overwrite to not being used.
+            settings.import_settings_from_macho(&macho_data)?;
 
             let mut new_data = Vec::<u8>::with_capacity(macho_data.len() + 2_usize.pow(17));
             signer.write_signed_binary(&settings, &mut new_data)?;

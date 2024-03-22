@@ -99,7 +99,7 @@ impl From<RequirementType> for u32 {
 
 impl PartialOrd for RequirementType {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        u32::from(*self).partial_cmp(&u32::from(*other))
+        Some(self.cmp(other))
     }
 }
 
@@ -523,7 +523,7 @@ pub enum CodeRequirementExpression<'a> {
 
     /// The certificate chain must anchor to a certificate with specified SHA-1 hash.
     ///
-    /// `anchor <slot> H"<hash>"`
+    /// `certificate <slot> = H"<hash>"`
     ///
     /// 4 bytes slot number, 4 bytes hash length, hash value.
     AnchorCertificateHash(i32, Cow<'a, [u8]>),
@@ -673,9 +673,11 @@ impl<'a> Display for CodeRequirementExpression<'a> {
             Self::True => f.write_str("always"),
             Self::Identifier(value) => f.write_fmt(format_args!("identifier \"{value}\"")),
             Self::AnchorApple => f.write_str("anchor apple"),
-            Self::AnchorCertificateHash(slot, digest) => {
-                f.write_fmt(format_args!("anchor {} H\"{}\"", slot, hex::encode(digest)))
-            }
+            Self::AnchorCertificateHash(slot, digest) => f.write_fmt(format_args!(
+                "certificate {} = H\"{}\"",
+                format_certificate_slot(*slot),
+                hex::encode(digest)
+            )),
             Self::InfoKeyValueLegacy(key, value) => {
                 f.write_fmt(format_args!("info[{key}] = \"{value}\""))
             }
@@ -685,9 +687,7 @@ impl<'a> Display for CodeRequirementExpression<'a> {
                 f.write_fmt(format_args!("cdhash H\"{}\"", hex::encode(digest)))
             }
             Self::Not(expr) => f.write_fmt(format_args!("!({expr})")),
-            Self::InfoPlistKeyField(key, expr) => {
-                f.write_fmt(format_args!("info [{key}] {expr}"))
-            }
+            Self::InfoPlistKeyField(key, expr) => f.write_fmt(format_args!("info [{key}] {expr}")),
             Self::CertificateField(slot, field, expr) => f.write_fmt(format_args!(
                 "certificate {}[{}] {}",
                 format_certificate_slot(*slot),

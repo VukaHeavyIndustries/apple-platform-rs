@@ -13,14 +13,13 @@ This module implements functionality for uploading content to Apple
 and waiting on the availability of a notarization ticket.
 */
 
-pub use app_store_connect::notary_api;
 use {
     crate::{reader::PathType, AppleCodesignError},
-    app_store_connect::{AppStoreConnectClient, ConnectTokenEncoder, UnifiedApiKey},
+    app_store_connect::{notary_api, AppStoreConnectClient, ConnectTokenEncoder, UnifiedApiKey},
     apple_bundles::DirectoryBundle,
     aws_sdk_s3::config::{Credentials, Region},
-    aws_smithy_http::byte_stream::ByteStream,
-    log::{info, warn},
+    aws_smithy_types::byte_stream::ByteStream,
+    log::warn,
     sha2::Digest,
     std::{
         fs::File,
@@ -296,7 +295,7 @@ impl Notarizer {
         // upload using s3 api
         warn!("resolving AWS S3 configuration from Apple-provided credentials");
         let config = rt.block_on(
-            aws_config::from_env()
+            aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .credentials_provider(Credentials::new(
                     submission.data.attributes.aws_access_key_id.clone(),
                     submission.data.attributes.aws_secret_access_key.clone(),
@@ -317,7 +316,7 @@ impl Notarizer {
             "uploading asset to s3://{}/{}",
             submission.data.attributes.bucket, submission.data.attributes.object
         );
-        info!("(you may see additional log output from S3 client)");
+        warn!("(you may see additional log output from S3 client)");
 
         // TODO: Support multi-part upload.
         // Unfortunately, aws-sdk-s3 does not have a simple upload_file helper
@@ -330,7 +329,8 @@ impl Notarizer {
             .body(bytestream)
             .send();
 
-        rt.block_on(fut).map_err(aws_sdk_s3::Error::from)?;
+        rt.block_on(fut)
+            .map_err(|e| AppleCodesignError::AwsS3Error(Box::new(aws_sdk_s3::Error::from(e))))?;
 
         warn!("S3 upload completed successfully");
 
@@ -382,7 +382,7 @@ impl Notarizer {
 
             let elapsed = start_time.elapsed();
 
-            info!(
+            warn!(
                 "poll state after {}s: {:?}",
                 elapsed.as_secs(),
                 status.data.attributes.status
@@ -430,5 +430,9 @@ impl Notarizer {
         }
 
         Ok(status)
+    }
+
+    pub fn list_submissions(&self) -> Result<notary_api::ListSubmissionResponse, AppleCodesignError> {
+        Ok(self.client()?.list_submissions()?)
     }
 }

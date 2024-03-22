@@ -237,6 +237,8 @@ pub enum Platform {
     MacOsX,
     WatchOs,
     WatchSimulator,
+    XrOs,
+    XrOsSimulator,
     Unknown(String),
 }
 
@@ -254,6 +256,8 @@ impl FromStr for Platform {
             "macosx" => Ok(Self::MacOsX),
             "watchos" => Ok(Self::WatchOs),
             "watchsimulator" => Ok(Self::WatchSimulator),
+            "xros" => Ok(Self::XrOs),
+            "xrsimulator" => Ok(Self::XrOsSimulator),
             v => Ok(Self::Unknown(v.to_string())),
         }
     }
@@ -318,6 +322,8 @@ impl Platform {
             target if target.ends_with("-apple-watchos") => Platform::WatchOs,
             "x86_64-apple-tvos" => Self::AppleTvSimulator,
             target if target.ends_with("-apple-tvos") => Platform::AppleTvOs,
+            "aarch64-apple-xros-sim" => Platform::XrOsSimulator,
+            target if target.ends_with("-apple-xros") => Platform::XrOs,
             _ => return Err(Error::UnknownTarget(target.to_string())),
         };
         Ok(platform)
@@ -339,6 +345,8 @@ impl Platform {
             Self::MacOsX => "MacOSX",
             Self::WatchOs => "WatchOS",
             Self::WatchSimulator => "WatchSimulator",
+            Self::XrOs => "XROS",
+            Self::XrOsSimulator => "XRSimulator",
             Self::Unknown(v) => v,
         }
     }
@@ -437,7 +445,7 @@ impl Eq for PlatformDirectory {}
 
 impl PartialOrd for PlatformDirectory {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.path.partial_cmp(&other.path)
+        Some(self.cmp(other))
     }
 }
 
@@ -816,16 +824,16 @@ impl SdkVersion {
 
 impl PartialOrd for SdkVersion {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        let a = self.normalized_version().unwrap_or((0, 0, 0));
-        let b = other.normalized_version().unwrap_or((0, 0, 0));
-
-        a.partial_cmp(&b)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for SdkVersion {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
+        let a = self.normalized_version().unwrap_or((0, 0, 0));
+        let b = other.normalized_version().unwrap_or((0, 0, 0));
+
+        a.cmp(&b)
     }
 }
 
@@ -1081,6 +1089,8 @@ mod test {
         test("x86_64-apple-ios-macabi", IPhoneOs);
         test("x86_64-apple-tvos", AppleTvSimulator);
         test("x86_64-apple-watchos-sim", WatchSimulator);
+        test("aarch64-apple-xros", XrOs);
+        test("aarch64-apple-xros-sim", XrOsSimulator);
 
         assert!(Platform::from_target_triple("x86_64-unknown-linux-gnu").is_err());
 

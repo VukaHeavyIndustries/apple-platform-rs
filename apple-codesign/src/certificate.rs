@@ -11,6 +11,7 @@ use {
         ConstOid, Oid,
     },
     bytes::Bytes,
+    pkcs8::EncodePrivateKey,
     std::{
         fmt::{Display, Formatter},
         str::FromStr,
@@ -247,7 +248,17 @@ const OID_CA_EXTENSION_APPLE_WORLDWIDE_DEVELOPER_RELATIONS_G2: ConstOid =
 const OID_CA_EXTENSION_APPLE_SOFTWARE_UPDATE_CERTIFICATION: ConstOid =
     Oid(&[42, 134, 72, 134, 247, 99, 100, 6, 2, 19]);
 
-const ALL_OID_CA_EXTENSIONS: &[&ConstOid; 8] = &[
+/// Apple Application Integration CA - G1.
+///
+/// This was introduced in `Apple Application Integration CA 7 - G1`
+/// The previous `Apple Application Integration CA 5 - G1` certificate
+/// had the legacy 1.2.840.113635.100.6.2.3 extension.
+///
+/// 1.2.840.113635.100.6.2.31
+const OID_CA_EXTENSION_APPLE_APPLICATION_INTEGRATION_G1: ConstOid =
+    Oid(&[42, 134, 72, 134, 247, 99, 100, 6, 2, 31]);
+
+const ALL_OID_CA_EXTENSIONS: &[&ConstOid; 9] = &[
     &OID_CA_EXTENSION_APPLE_WORLDWIDE_DEVELOPER_RELATIONS,
     &OID_CA_EXTENSION_APPLE_APPLICATION_INTEGRATION,
     &OID_CA_EXTENSION_DEVELOPER_ID,
@@ -256,6 +267,7 @@ const ALL_OID_CA_EXTENSIONS: &[&ConstOid; 8] = &[
     &OID_CA_EXTENSION_APPLE_APPLICATION_INTEGRATION_G3,
     &OID_CA_EXTENSION_APPLE_WORLDWIDE_DEVELOPER_RELATIONS_G2,
     &OID_CA_EXTENSION_APPLE_SOFTWARE_UPDATE_CERTIFICATION,
+    &OID_CA_EXTENSION_APPLE_APPLICATION_INTEGRATION_G1,
 ];
 
 /// Describes the type of code signing that a certificate is authorized to perform.
@@ -593,6 +605,9 @@ pub enum CertificateAuthorityExtension {
 
     /// Apple Software Update Certification.
     AppleSoftwareUpdateCertification,
+
+    /// Apple Application Integration CA - G1.
+    AppleApplicationIntegrationG1,
 }
 
 impl CertificateAuthorityExtension {
@@ -607,6 +622,7 @@ impl CertificateAuthorityExtension {
             Self::AppleApplicationIntegrationG3,
             Self::AppleWorldwideDeveloperRelationsG2,
             Self::AppleSoftwareUpdateCertification,
+            Self::AppleApplicationIntegrationG1,
         ]
     }
 
@@ -633,6 +649,9 @@ impl CertificateAuthorityExtension {
             Self::AppleSoftwareUpdateCertification => {
                 OID_CA_EXTENSION_APPLE_SOFTWARE_UPDATE_CERTIFICATION
             }
+            Self::AppleApplicationIntegrationG1 => {
+                OID_CA_EXTENSION_APPLE_APPLICATION_INTEGRATION_G1
+            }
         }
     }
 }
@@ -654,13 +673,16 @@ impl Display for CertificateAuthorityExtension {
                 f.write_str("Developer Authentication Certification Authority")
             }
             CertificateAuthorityExtension::AppleApplicationIntegrationG3 => {
-                f.write_str("Application Application Integration CA - G3")
+                f.write_str("Apple Application Integration CA - G3")
             }
             CertificateAuthorityExtension::AppleWorldwideDeveloperRelationsG2 => {
                 f.write_str("Apple Worldwide Developer Relations CA - G2")
             }
             CertificateAuthorityExtension::AppleSoftwareUpdateCertification => {
                 f.write_str("Apple Software Update Certification")
+            }
+            CertificateAuthorityExtension::AppleApplicationIntegrationG1 => {
+                f.write_str("Apple Application Integration CA - G1")
             }
         }
     }
@@ -687,6 +709,8 @@ impl TryFrom<&Oid> for CertificateAuthorityExtension {
             Ok(Self::AppleWorldwideDeveloperRelationsG2)
         } else if oid.as_ref() == OID_CA_EXTENSION_APPLE_SOFTWARE_UPDATE_CERTIFICATION.as_ref() {
             Ok(Self::AppleSoftwareUpdateCertification)
+        } else if oid.as_ref() == OID_CA_EXTENSION_APPLE_APPLICATION_INTEGRATION_G1.as_ref() {
+            Ok(Self::AppleApplicationIntegrationG1)
         } else {
             Err(AppleCodesignError::OidIsntCertificateAuthority)
         }
@@ -819,15 +843,15 @@ pub trait AppleCertificate: Sized {
     /// known self-signed Apple certificates.
     fn is_apple_intermediate_ca(&self) -> bool;
 
-    /// Find a [CertificateAuthorityExtension] present on this certificate.
+    /// Find [CertificateAuthorityExtension] present on this certificate.
     ///
-    /// If this returns Some(T), the certificate says it is an Apple certificate
+    /// If this is non-empty, the certificate says it is an Apple certificate
     /// whose role is issuing other certificates using for signing things.
     ///
     /// This function does not perform trust validation that the underlying
     /// certificate is a legitimate Apple issued certificate: just that it has
     /// the desired property.
-    fn apple_ca_extension(&self) -> Option<CertificateAuthorityExtension>;
+    fn apple_ca_extensions(&self) -> Vec<CertificateAuthorityExtension>;
 
     /// Obtain all of Apple's [ExtendedKeyUsagePurpose] in this certificate.
     fn apple_extended_key_usage_purposes(&self) -> Vec<ExtendedKeyUsagePurpose>;
@@ -876,6 +900,9 @@ pub trait AppleCertificate: Sized {
     /// certificates as the Organizational Unit field of the subject. So this
     /// function is just a shortcut for retrieving that.
     fn apple_team_id(&self) -> Option<String>;
+
+    /// Whether this is a certificate pretending to be signed by an Apple CA but isn't really.
+    fn is_test_apple_signed_certificate(&self) -> bool;
 }
 
 impl AppleCertificate for CapturedX509Certificate {
@@ -887,16 +914,12 @@ impl AppleCertificate for CapturedX509Certificate {
         KnownCertificate::all().contains(&self) && !KnownCertificate::all_roots().contains(&self)
     }
 
-    fn apple_ca_extension(&self) -> Option<CertificateAuthorityExtension> {
+    fn apple_ca_extensions(&self) -> Vec<CertificateAuthorityExtension> {
         let cert: &x509_certificate::rfc5280::Certificate = self.as_ref();
 
-        cert.iter_extensions().find_map(|extension| {
-            if let Ok(value) = CertificateAuthorityExtension::try_from(&extension.id) {
-                Some(value)
-            } else {
-                None
-            }
-        })
+        cert.iter_extensions()
+            .filter_map(|extension| CertificateAuthorityExtension::try_from(&extension.id).ok())
+            .collect::<Vec<_>>()
     }
 
     fn apple_extended_key_usage_purposes(&self) -> Vec<ExtendedKeyUsagePurpose> {
@@ -1009,6 +1032,15 @@ impl AppleCertificate for CapturedX509Certificate {
             ))
             .unwrap_or(None)
     }
+
+    fn is_test_apple_signed_certificate(&self) -> bool {
+        if let Ok(digest) = self.sha256_fingerprint() {
+            hex::encode(digest)
+                == "5939ad5770d8b977b38d07533754371314744e87a8d606433f689e9bc6b980a0"
+        } else {
+            false
+        }
+    }
 }
 
 /// Extensions to [X509CertificateBuilder] specializing in Apple certificate behavior.
@@ -1091,9 +1123,7 @@ impl AppleCertificateBuilder for X509CertificateBuilder {
             } else if extensions
                 .contains(&CodeSigningCertificateExtension::AppleMacAppSigningSubmission)
             {
-                format!(
-                    "3rd Party Mac Developer Installer: {person_name} ({team_id})"
-                )
+                format!("3rd Party Mac Developer Installer: {person_name} ({team_id})")
             } else if extensions.contains(&CodeSigningCertificateExtension::MacDeveloper) {
                 format!("Apple Development: {person_name} ({team_id})")
             } else {
@@ -1326,21 +1356,37 @@ pub fn create_self_signed_code_signing_certificate(
     person_name: &str,
     country: &str,
     validity_duration: chrono::Duration,
-) -> Result<
-    (
-        CapturedX509Certificate,
-        InMemorySigningKeyPair,
-        ring::pkcs8::Document,
-    ),
-    AppleCodesignError,
-> {
-    let mut builder = X509CertificateBuilder::new(algorithm);
+) -> Result<(CapturedX509Certificate, InMemorySigningKeyPair), AppleCodesignError> {
+    let mut builder = X509CertificateBuilder::default();
 
     builder.apple_certificate_profile(profile)?;
     builder.apple_subject(team_id, person_name, country)?;
     builder.validity_duration(validity_duration);
 
-    Ok(builder.create_with_random_keypair()?)
+    // x509-certificate crate doesn't support RSA key generation. So do
+    // that ourselves.
+    if matches!(algorithm, KeyAlgorithm::Rsa) {
+        let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).map_err(|e| {
+            AppleCodesignError::CertificateBuildError(format!("error generating RSA key: {}", e))
+        })?;
+        let key_pair = InMemorySigningKeyPair::from_pkcs8_der(
+            private_key
+                .to_pkcs8_der()
+                .map_err(|e| {
+                    AppleCodesignError::CertificateGeneric(format!(
+                        "error converting RSA key to DER: {}",
+                        e
+                    ))
+                })?
+                .as_bytes(),
+        )?;
+
+        let cert = builder.create_with_key_pair(&key_pair)?;
+
+        Ok((cert, key_pair))
+    } else {
+        Ok(builder.create_with_random_keypair(algorithm)?)
+    }
 }
 
 #[cfg(test)]
@@ -1397,7 +1443,7 @@ mod tests {
     #[test]
     fn cms_self_signed_certificate_signing_ecdsa() {
         for curve in EcdsaCurve::all() {
-            let (cert, signing_key, _) = create_self_signed_code_signing_certificate(
+            let (cert, signing_key) = create_self_signed_code_signing_certificate(
                 KeyAlgorithm::Ecdsa(*curve),
                 CertificateProfile::DeveloperIdInstaller,
                 "team",
@@ -1428,7 +1474,7 @@ mod tests {
 
     #[test]
     fn cms_self_signed_certificate_signing_ed25519() {
-        let (cert, signing_key, _) = create_self_signed_code_signing_certificate(
+        let (cert, signing_key) = create_self_signed_code_signing_certificate(
             KeyAlgorithm::Ed25519,
             CertificateProfile::DeveloperIdInstaller,
             "team",
@@ -1492,12 +1538,15 @@ mod tests {
         );
         assert_eq!(cert.apple_team_id(), Some("MK22MZP987".into()));
 
-        let mut builder = X509CertificateBuilder::new(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1));
+        let mut builder = X509CertificateBuilder::default();
         builder
             .apple_certificate_profile(CertificateProfile::MacInstallerDistribution)
             .unwrap();
 
-        let built = builder.create_with_random_keypair().unwrap().0;
+        let built = builder
+            .create_with_random_keypair(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1))
+            .unwrap()
+            .0;
 
         assert_eq!(
             built.apple_extended_key_usage_purposes(),
@@ -1552,12 +1601,15 @@ mod tests {
         );
         assert_eq!(cert.apple_team_id(), Some("MK22MZP987".into()));
 
-        let mut builder = X509CertificateBuilder::new(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1));
+        let mut builder = X509CertificateBuilder::default();
         builder
             .apple_certificate_profile(CertificateProfile::AppleDevelopment)
             .unwrap();
 
-        let built = builder.create_with_random_keypair().unwrap().0;
+        let built = builder
+            .create_with_random_keypair(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1))
+            .unwrap()
+            .0;
 
         assert_eq!(
             built.apple_extended_key_usage_purposes(),
@@ -1612,12 +1664,15 @@ mod tests {
         );
         assert_eq!(cert.apple_team_id(), Some("MK22MZP987".into()));
 
-        let mut builder = X509CertificateBuilder::new(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1));
+        let mut builder = X509CertificateBuilder::default();
         builder
             .apple_certificate_profile(CertificateProfile::AppleDistribution)
             .unwrap();
 
-        let built = builder.create_with_random_keypair().unwrap().0;
+        let built = builder
+            .create_with_random_keypair(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1))
+            .unwrap()
+            .0;
 
         assert_eq!(
             built.apple_extended_key_usage_purposes(),
@@ -1672,12 +1727,15 @@ mod tests {
         );
         assert_eq!(cert.apple_team_id(), Some("MK22MZP987".into()));
 
-        let mut builder = X509CertificateBuilder::new(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1));
+        let mut builder = X509CertificateBuilder::default();
         builder
             .apple_certificate_profile(CertificateProfile::DeveloperIdApplication)
             .unwrap();
 
-        let built = builder.create_with_random_keypair().unwrap().0;
+        let built = builder
+            .create_with_random_keypair(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1))
+            .unwrap()
+            .0;
 
         assert_eq!(
             built.apple_extended_key_usage_purposes(),
@@ -1736,12 +1794,15 @@ mod tests {
         );
         assert_eq!(cert.apple_team_id(), Some("MK22MZP987".into()));
 
-        let mut builder = X509CertificateBuilder::new(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1));
+        let mut builder = X509CertificateBuilder::default();
         builder
             .apple_certificate_profile(CertificateProfile::DeveloperIdInstaller)
             .unwrap();
 
-        let built = builder.create_with_random_keypair().unwrap().0;
+        let built = builder
+            .create_with_random_keypair(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1))
+            .unwrap()
+            .0;
 
         assert_eq!(
             built.apple_extended_key_usage_purposes(),

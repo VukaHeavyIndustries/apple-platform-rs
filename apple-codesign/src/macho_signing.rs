@@ -10,9 +10,10 @@ use {
     crate::{
         code_directory::{CodeDirectoryBlob, CodeSignatureFlags, ExecutableSegmentFlags},
         code_requirement::{CodeRequirementExpression, CodeRequirements, RequirementType},
+        cryptography::Digest,
         embedded_signature::{
-            BlobData, CodeSigningSlot, Digest, EntitlementsBlob, EntitlementsDerBlob,
-            RequirementSetBlob,
+            Blob, BlobData, CodeSigningSlot, ConstraintsDerBlob, EntitlementsBlob,
+            EntitlementsDerBlob, RequirementSetBlob,
         },
         embedded_signature_builder::EmbeddedSignatureBuilder,
         entitlements::plist_to_executable_segment_flags,
@@ -47,11 +48,25 @@ fn create_macho_with_signature(
     // is at the end of the __LINKEDIT segment. So the replacement segment is the
     // existing segment truncated at the signature start followed by the new signature
     // data.
-    let new_linkedit_segment_size = macho
+    //
+    // Code signature data is aligned on 16 byte boundary by Apple convention.
+    //
+    // Typically segment data is aligned on pages, which are multiples of 16 bytes. So
+    // it doesn't matter if we align based on Mach-O file-level or __LINKEDIT
+    // segment-level offsets: the end result is 16 byte alignment in both.
+
+    let linkedit_data_before_signature = macho
         .linkedit_data_before_signature()
-        .ok_or(AppleCodesignError::MissingLinkedit)?
-        .len()
-        + signature_data.len();
+        .ok_or(AppleCodesignError::MissingLinkedit)?;
+
+    let signature_file_offset = macho.code_limit_binary_offset()?;
+    let remainder = (signature_file_offset % 16) as usize;
+    let signature_padding_length = if remainder == 0 { 0 } else { 16 - remainder };
+
+    let signature_file_offset = signature_file_offset + signature_padding_length as u64;
+
+    let new_linkedit_segment_size =
+        linkedit_data_before_signature.len() + signature_padding_length + signature_data.len();
 
     // `codesign` rounds up the segment's vmsize to the nearest 16kb boundary.
     // We emulate that behavior.
@@ -97,6 +112,7 @@ fn create_macho_with_signature(
                 seen_signature_load_command = true;
 
                 let mut command = *command;
+                command.dataoff = signature_file_offset as _;
                 command.datasize = signature_data.len() as _;
 
                 cursor.iowrite_with(command, ctx.le)?;
@@ -148,22 +164,29 @@ fn create_macho_with_signature(
     }
 
     // If we didn't see a signature load command, write one out now.
+    // Note: we're assuming that there's enough space between the end of
+    // the original load commands and the beginning of the first section.
+    // All this intermediate data should be 0s and we shouldn't be
+    // interfering with anything here. But you never know.
+    // TODO validate the added load command doesn't overflow into a section
+    // or otherwise clobber data in the binary.
     if !seen_signature_load_command {
         let command = LinkeditDataCommand {
             cmd: LC_CODE_SIGNATURE,
             cmdsize: SIZEOF_LINKEDIT_DATA_COMMAND as _,
-            dataoff: macho.code_limit_binary_offset()? as _,
+            dataoff: signature_file_offset as _,
             datasize: signature_data.len() as _,
         };
 
         cursor.iowrite_with(command, ctx.le)?;
     }
 
+    let mut wrote_non_empty_segment = false;
+
     // Write out segments, updating the __LINKEDIT segment when we encounter it.
     for segment in macho.segments_by_file_offset() {
         // The initial __PAGEZERO segment contains no data (it is the magic and load
-        // commands) and overlaps with the __TEXT segment, which has .fileoff =0, so
-        // we ignore it.
+        // commands) and overlaps with the __TEXT segment, so we ignore it.
         if matches!(segment.name(), Ok(SEG_PAGEZERO)) {
             continue;
         }
@@ -180,9 +203,19 @@ fn create_macho_with_signature(
                 );
                 cursor.write_all(padding)?;
             }
+
             // The __TEXT segment usually has .fileoff = 0, which has it overlapping with
             // already written data. Allow this special case through.
             Ordering::Greater if segment.fileoff == 0 => {}
+
+            // The initial non-empty segment is special because it can overlap
+            // we the already written load commands.
+            //
+            // Usually the first non-empty segment is __TEXT and its file start
+            // offset is 0x0. But we've seen binaries in the wild where the
+            // offset is > 0x0. As long as the current cursor is before the first
+            // section data, there should be no data corruption and we're good.
+            Ordering::Greater if !wrote_non_empty_segment => {}
 
             // The writer has overran into this segment. That means we screwed up on a
             // previous loop iteration.
@@ -196,8 +229,6 @@ fn create_macho_with_signature(
             Ordering::Equal => {}
         }
 
-        assert!(segment.fileoff == 0 || segment.fileoff == cursor.position());
-
         match segment.name() {
             Ok(SEG_LINKEDIT) => {
                 cursor.write_all(
@@ -205,6 +236,12 @@ fn create_macho_with_signature(
                         .linkedit_data_before_signature()
                         .expect("__LINKEDIT segment data should resolve"),
                 )?;
+
+                let padding = vec![0u8; signature_padding_length];
+                cursor.write_all(&padding)?;
+
+                assert_eq!(cursor.position(), signature_file_offset);
+                assert_eq!(cursor.position() % 16, 0);
                 cursor.write_all(signature_data)?;
             }
             _ => {
@@ -223,6 +260,8 @@ fn create_macho_with_signature(
                 }
             }
         }
+
+        wrote_non_empty_segment = true;
     }
 
     Ok(cursor.into_inner())
@@ -303,10 +342,11 @@ impl<'data> MachOSigner<'data> {
             .enumerate()
             .map(|(index, original_macho)| {
                 info!("signing Mach-O binary at index {}", index);
-                let settings =
-                    settings.as_nested_macho_settings(index, original_macho.macho.header.cputype());
+                let settings = settings
+                    .as_universal_macho_settings(index, original_macho.macho.header.cputype());
 
-                let signature_len = original_macho.estimate_embedded_signature_size(&settings)?;
+                let signature_len =
+                    self.estimate_embedded_signature_size(original_macho, &settings)?;
 
                 // Derive an intermediate Mach-O with placeholder NULLs for signature
                 // data so Code Directory digests over the load commands are correct.
@@ -377,7 +417,7 @@ impl<'data> MachOSigner<'data> {
                 // Since everything consults settings for the digest to use, just make a new settings
                 // with a different digest.
                 let mut alt_settings = settings.clone();
-                alt_settings.set_digest_type(*digest_type);
+                alt_settings.set_digest_type(SettingsScope::Main, *digest_type);
 
                 info!(
                     "adding alternative code directory using digest {:?}",
@@ -395,7 +435,10 @@ impl<'data> MachOSigner<'data> {
                 signing_cert,
                 settings.time_stamp_url(),
                 settings.certificate_chain().iter().cloned(),
+                settings.signing_time(),
             )?;
+        } else {
+            builder.create_empty_cms_signature()?;
         }
 
         builder.create_superblob()
@@ -519,8 +562,10 @@ impl<'data> MachOSigner<'data> {
             runtime
         };
 
+        let digest_type = settings.digest_type(SettingsScope::Main);
+
         let code_hashes = macho
-            .code_digests(*settings.digest_type(), page_size as _)?
+            .code_digests(digest_type, page_size as _)?
             .into_iter()
             .map(|v| Digest { data: v.into() })
             .collect::<Vec<_>>();
@@ -533,7 +578,7 @@ impl<'data> MachOSigner<'data> {
             special_hashes.insert(
                 CodeSigningSlot::Info,
                 Digest {
-                    data: settings.digest_type().digest_data(data)?.into(),
+                    data: digest_type.digest_data(data)?.into(),
                 },
             );
         }
@@ -544,7 +589,7 @@ impl<'data> MachOSigner<'data> {
             special_hashes.insert(
                 CodeSigningSlot::ResourceDir,
                 Digest {
-                    data: settings.digest_type().digest_data(data)?.into(),
+                    data: digest_type.digest_data(data)?.into(),
                 }
                 .to_owned(),
             );
@@ -557,13 +602,20 @@ impl<'data> MachOSigner<'data> {
                 .to_string(),
         );
 
+        // Team should only be included when signing with an Apple signed
+        // certificate. This logic is handled in [SigningSettings]. But emit
+        // a warning if the constraint is violated.
         let team_name = settings.team_id().map(|x| Cow::Owned(x.to_string()));
+
+        if team_name.is_some() && !settings.signing_certificate_apple_signed() {
+            warn!("signing without an Apple signed certificate but signing settings contain a team name; signature varies from Apple's tooling");
+        }
 
         let mut cd = CodeDirectoryBlob {
             flags,
             code_limit,
-            digest_size: settings.digest_type().hash_len()? as u8,
-            digest_type: *settings.digest_type(),
+            digest_size: digest_type.hash_len()? as u8,
+            digest_type,
             platform,
             page_size,
             code_limit_64,
@@ -608,7 +660,7 @@ impl<'data> MachOSigner<'data> {
                 // If we are using an Apple-issued cert, this should automatically
                 // derive appropriate designated requirements.
                 if let Some((_, cert)) = settings.signing_key() {
-                    info!("attempting to derive code requirements from signing certificate");
+                    info!("deriving code requirements from signing certificate");
                     let identifier = Some(
                         settings
                             .binary_identifier(SettingsScope::Main)
@@ -616,9 +668,12 @@ impl<'data> MachOSigner<'data> {
                             .to_string(),
                     );
 
-                    if let Some(expr) = derive_designated_requirements(cert, identifier)? {
-                        requirements.push(expr);
-                    }
+                    let expr = derive_designated_requirements(
+                        cert,
+                        settings.certificate_chain(),
+                        identifier,
+                    )?;
+                    requirements.push(expr);
                 }
             }
             DesignatedRequirementMode::Explicit(exprs) => {
@@ -634,14 +689,12 @@ impl<'data> MachOSigner<'data> {
         let mut blob = RequirementSetBlob::default();
 
         if !requirements.is_empty() {
-            info!("code requirements: {}", requirements);
             requirements.add_to_requirement_set(&mut blob, RequirementType::Designated)?;
         }
 
         res.push((CodeSigningSlot::RequirementSet, blob.into()));
 
         if let Some(entitlements) = settings.entitlements_xml(SettingsScope::Main)? {
-            info!("adding entitlements XML");
             let blob = EntitlementsBlob::from_string(&entitlements);
 
             res.push((CodeSigningSlot::Entitlements, blob.into()));
@@ -654,13 +707,89 @@ impl<'data> MachOSigner<'data> {
         // an executable (.filetype == MH_EXECUTE).
         if is_executable {
             if let Some(value) = settings.entitlements_plist(SettingsScope::Main) {
-                info!("adding entitlements DER");
                 let blob = EntitlementsDerBlob::from_plist(value)?;
 
                 res.push((CodeSigningSlot::EntitlementsDer, blob.into()));
             }
         }
 
+        if let Some(constraints) = settings.launch_constraints_self(SettingsScope::Main) {
+            let blob = ConstraintsDerBlob::from_encoded_constraints(constraints)?;
+            res.push((CodeSigningSlot::LaunchConstraintsSelf, blob.into()));
+        }
+
+        if let Some(constraints) = settings.launch_constraints_parent(SettingsScope::Main) {
+            let blob = ConstraintsDerBlob::from_encoded_constraints(constraints)?;
+            res.push((CodeSigningSlot::LaunchConstraintsParent, blob.into()));
+        }
+
+        if let Some(constraints) = settings.launch_constraints_responsible(SettingsScope::Main) {
+            let blob = ConstraintsDerBlob::from_encoded_constraints(constraints)?;
+            res.push((
+                CodeSigningSlot::LaunchConstraintsResponsibleProcess,
+                blob.into(),
+            ));
+        }
+
+        if let Some(constraints) = settings.library_constraints(SettingsScope::Main) {
+            let blob = ConstraintsDerBlob::from_encoded_constraints(constraints)?;
+            res.push((CodeSigningSlot::LibraryConstraints, blob.into()));
+        }
+
         Ok(res)
+    }
+
+    /// Estimate the size in bytes of an embedded code signature.
+    pub fn estimate_embedded_signature_size(
+        &self,
+        macho: &MachOBinary,
+        settings: &SigningSettings,
+    ) -> Result<usize, AppleCodesignError> {
+        let code_directory_count = 1 + settings
+            .extra_digests(SettingsScope::Main)
+            .map(|x| x.len())
+            .unwrap_or_default();
+
+        // Assume the common data structures are 1024 bytes.
+        let mut size = 1024 * code_directory_count;
+
+        // Reserve room for the code digests, which are proportional to binary size.
+        size += macho.code_digests_size(settings.digest_type(SettingsScope::Main), 4096)?;
+
+        if let Some(digests) = settings.extra_digests(SettingsScope::Main) {
+            for digest in digests {
+                size += macho.code_digests_size(*digest, 4096)?;
+            }
+        }
+
+        // Add in sizes of all encoded blobs, as many blobs are variable size.
+        for (_, blob) in self.create_special_blobs(settings, true)? {
+            size += blob.to_blob_bytes()?.len();
+        }
+
+        // Assume the CMS data will take a fixed size.
+        size += 4096;
+
+        // Long certificate chains could blow up the size. Account for those.
+        for cert in settings.certificate_chain() {
+            size += cert.constructed_data().len();
+        }
+
+        // Resize space for CMS timestamp token, if being generated.
+        //
+        // We used to actually call out to a remote server here and obtain a
+        // placeholder token. But this seemed excessive, especially since we did
+        // it on every signing operation.
+        //
+        // Apple's TSTs are ~4200 bytes in size. We approximately double that
+        // to give us some buffer.
+        if settings.time_stamp_url().is_some() {
+            size += 8192;
+        }
+
+        // Align on 1k boundaries just because.
+        size += 1024 - size % 1024;
+
+        Ok(size)
     }
 }

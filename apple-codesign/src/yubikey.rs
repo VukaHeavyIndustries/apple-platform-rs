@@ -12,13 +12,13 @@ use {
     },
     bcder::encode::Values,
     bytes::Bytes,
+    der::Encode,
     log::{error, warn},
     signature::Signer,
     std::{
         ops::DerefMut,
         sync::{Arc, Mutex, MutexGuard},
     },
-    x509::SubjectPublicKeyInfo,
     x509_certificate::{
         asn1time, rfc3280, rfc5280, CapturedX509Certificate, EcdsaCurve, KeyAlgorithm,
         KeyInfoSigner, Sign, Signature, SignatureAlgorithm, X509CertificateError,
@@ -209,7 +209,7 @@ impl YubiKey {
         for slot in slots {
             let cert = YkCertificate::read(yk, slot)?;
 
-            let cert = CapturedX509Certificate::from_der(cert.into_buffer().to_vec())?;
+            let cert = CapturedX509Certificate::from_der(cert.cert.to_der()?)?;
 
             res.push((slot, cert));
         }
@@ -273,7 +273,7 @@ impl YubiKey {
         attempt_authenticated_operation(
             yk.deref_mut(),
             |yk| {
-                let rsa_key = ::yubikey::piv::RsaKeyData::new(p, q);
+                let rsa_key = ::yubikey::piv::RsaKeyData::new(p, q)?;
 
                 import_rsa_key(yk, slot, algorithm, rsa_key, touch_policy, pin_policy)?;
 
@@ -453,7 +453,10 @@ impl YubiKey {
             subject,
             subject_public_key_info: rfc5280::SubjectPublicKeyInfo {
                 algorithm: key_algorithm.into(),
-                subject_public_key: bcder::BitString::new(0, key_info.public_key().into()),
+                subject_public_key: bcder::BitString::new(
+                    0,
+                    key_info.subject_public_key.raw_bytes().to_vec().into(),
+                ),
             },
             issuer_unique_id: None,
             subject_unique_id: None,
@@ -615,12 +618,14 @@ impl Sign for CertificateSigner {
             )))
     }
 
-    fn private_key_data(&self) -> Option<Vec<u8>> {
+    fn private_key_data(&self) -> Option<Zeroizing<Vec<u8>>> {
         // We never have access to private keys stored on hardware devices.
         None
     }
 
-    fn rsa_primes(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, X509CertificateError> {
+    fn rsa_primes(
+        &self,
+    ) -> Result<Option<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)>, X509CertificateError> {
         Ok(None)
     }
 }

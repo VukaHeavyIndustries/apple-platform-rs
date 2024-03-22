@@ -25,6 +25,9 @@ pub enum AppleCodesignError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("CLI error: {0}")]
+    CliDialoguer(#[from] dialoguer::Error),
+
     #[error("binary parsing error: {0}")]
     Goblin(#[from] goblin::error::Error),
 
@@ -79,6 +82,9 @@ pub enum AppleCodesignError {
     #[error("bad string value in certificate: {0:?}")]
     CertificateCharset(bcder::string::CharSetError),
 
+    #[error("DER: {0}")]
+    Der(#[from] der::Error),
+
     #[error("error parsing version string: {0}")]
     VersionParse(#[from] semver::Error),
 
@@ -130,8 +136,8 @@ pub enum AppleCodesignError {
     #[error("entitlements data not valid UTF-8: {0}")]
     EntitlementsBadUtf8(std::str::Utf8Error),
 
-    #[error("error when encoding entitlements to DER: {0}")]
-    EntitlementsDerEncode(String),
+    #[error("error with plist DER encoding: {0}")]
+    PlistDer(String),
 
     #[error("unknown executable segment flag: {0}")]
     ExecutableSegmentUnknownFlag(String),
@@ -193,6 +199,9 @@ pub enum AppleCodesignError {
     #[error("unspecified digest error")]
     DigestUnspecified,
 
+    #[error("deriving identifier from path: {0}")]
+    PathIdentifier(String),
+
     #[error("error interfacing with directory-based bundle: {0}")]
     DirectoryBundle(anyhow::Error),
 
@@ -226,6 +235,9 @@ pub enum AppleCodesignError {
     #[error("error interfacing with macOS keychain: {0}")]
     KeychainError(String),
 
+    #[error("error interfacing with Windows certificate store: {0}")]
+    WindowsStoreError(String),
+
     #[error("failed to find certificate satisfying requirements: {0}")]
     CertificateNotFound(String),
 
@@ -253,6 +265,9 @@ pub enum AppleCodesignError {
     #[error("error producing universal Mach-O binary: {0}")]
     UniversalMachO(#[from] UniversalMachOError),
 
+    #[error("walkdir error: {0}")]
+    WalkDir(#[from] walkdir::Error),
+
     #[error("zip error: {0}")]
     ZipError(#[from] zip::result::ZipError),
 
@@ -270,6 +285,9 @@ pub enum AppleCodesignError {
 
     #[error("Could not find App Store Connect API key in default search locations")]
     AppStoreConnectApiKeyNotFound,
+
+    #[error("signing settings are not compatible with notarization")]
+    ForNotarizationInvalidSettings,
 
     #[error("do not know how to notarize {0}")]
     NotarizeUnsupportedPath(PathBuf),
@@ -355,15 +373,27 @@ pub enum AppleCodesignError {
 
     #[cfg(feature = "notarize")]
     #[error("bytestream creation error: {0}")]
-    AwsByteStream(#[from] aws_smithy_http::byte_stream::error::Error),
+    AwsByteStream(#[from] aws_smithy_types::byte_stream::error::Error),
 
     #[cfg(feature = "notarize")]
     #[error("s3 upload error: {0}")]
-    AwsS3Error(#[from] aws_sdk_s3::Error),
+    AwsS3Error(Box<aws_sdk_s3::Error>),
 
     #[error("bad time value")]
     BadTime,
 
     #[error("{0}")]
     Anyhow(#[from] anyhow::Error),
+
+    #[error("plist: {0}")]
+    Plist(#[from] plist::Error),
+
+    #[error("config error: {0:?}")]
+    Figment(#[from] figment::Error),
+
+    #[error("environment constraints: {0}")]
+    EnvironmentConstraint(String),
 }
+
+/// Result type for this library.
+pub type Result<T, E = AppleCodesignError> = std::result::Result<T, E>;

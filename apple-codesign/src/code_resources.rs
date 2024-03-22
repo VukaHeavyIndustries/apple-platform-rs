@@ -17,18 +17,18 @@
 
 use {
     crate::{
-        bundle_signing::{BundleFileHandler, SignedMachOInfo},
-        embedded_signature::DigestType,
+        bundle_signing::{BundleSigningContext, SignedMachOInfo},
+        cryptography::{DigestType, MultiDigest},
         error::AppleCodesignError,
     },
-    apple_bundles::{DirectoryBundle, DirectoryBundleFile},
-    log::{debug, info, warn},
+    apple_bundles::DirectoryBundle,
+    log::{debug, error, info, warn},
     plist::{Dictionary, Value},
     std::{
         cmp::Ordering,
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         io::Write,
-        path::{Path, PathBuf},
+        path::Path,
     },
 };
 
@@ -492,14 +492,24 @@ pub struct CodeResourcesRule {
     /// The `<key>` in the `<rules>` or `<rules2>` dict.
     pub pattern: String,
 
-    /// Whether this is an exclusion rule.
+    /// Matched paths are excluded from processing completely.
+    ///
+    /// If any rule with this flag matches a path, the path is excluded.
     pub exclude: bool,
 
+    /// The matched path is a signable entity.
+    ///
+    /// The path should be signed before sealing. And its seal may be
+    /// stored specially.
     pub nested: bool,
 
+    /// Whether to omit the path from sealing.
+    ///
+    /// Paths matching this rule can exist in a bundle. But their content
+    /// isn't captured in the `CodeResources` file.
     pub omit: bool,
 
-    /// Whether the rule is optional.
+    /// Unknown. Best guess is whether the file's presence is optional.
     pub optional: bool,
 
     /// Weighting to apply to the rule.
@@ -523,23 +533,23 @@ impl Eq for CodeResourcesRule {}
 
 impl PartialOrd for CodeResourcesRule {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CodeResourcesRule {
+    fn cmp(&self, other: &Self) -> Ordering {
         // Default weight is 1 if not specified.
         let our_weight = self.weight.unwrap_or(1);
         let their_weight = other.weight.unwrap_or(1);
 
         // Exclusion rules always take priority over inclusion rules.
         // The smaller the weight, the less important it is.
-        match self.exclude.cmp(&other.exclude) {
-            Ordering::Equal => their_weight.partial_cmp(&our_weight),
-            Ordering::Greater => Some(Ordering::Less),
-            Ordering::Less => Some(Ordering::Greater),
+        match (self.exclude, other.exclude) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => their_weight.cmp(&our_weight),
         }
-    }
-}
-
-impl Ord for CodeResourcesRule {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
     }
 }
 
@@ -713,6 +723,7 @@ impl CodeResources {
         let data = String::from_utf8(data).expect("XML should be valid UTF-8");
         let data = data.replace("<dict />", "<dict/>");
         let data = data.replace("<true />", "<true/>");
+        let data = data.replace("&quot;", "\"");
 
         writer.write_all(data.as_bytes())?;
         writer.write_all(b"\n")?;
@@ -756,25 +767,24 @@ impl CodeResources {
         &mut self,
         files_flavor: FilesFlavor,
         path: impl ToString,
-        content: impl AsRef<[u8]>,
+        digests: MultiDigest,
         optional: bool,
     ) -> Result<(), AppleCodesignError> {
         match files_flavor {
             FilesFlavor::Rules => {
-                let digest = DigestType::Sha1.digest_data(content.as_ref())?;
                 self.files.insert(
                     path.to_string(),
                     if optional {
-                        FilesValue::Optional(digest)
+                        FilesValue::Optional(digests.sha1.to_vec())
                     } else {
-                        FilesValue::Required(digest)
+                        FilesValue::Required(digests.sha1.to_vec())
                     },
                 );
 
                 Ok(())
             }
             FilesFlavor::Rules2 => {
-                let hash2 = Some(DigestType::Sha256.digest_data(content.as_ref())?);
+                let hash2 = Some(digests.sha256.to_vec());
 
                 self.files2.insert(
                     path.to_string(),
@@ -791,8 +801,8 @@ impl CodeResources {
                 Ok(())
             }
             FilesFlavor::Rules2WithSha1 => {
-                let hash = Some(DigestType::Sha1.digest_data(content.as_ref())?);
-                let hash2 = Some(DigestType::Sha256.digest_data(content.as_ref())?);
+                let hash = Some(digests.sha1.to_vec());
+                let hash2 = Some(digests.sha256.to_vec());
 
                 self.files2.insert(
                     path.to_string(),
@@ -815,6 +825,7 @@ impl CodeResources {
     ///
     /// `path` is the path of the symlink and `target` is the path it points to.
     pub fn seal_symlink(&mut self, path: impl ToString, target: impl ToString) {
+        // Version 1 doesn't support sealing symlinks.
         self.files2.insert(
             path.to_string(),
             Files2Value {
@@ -905,31 +916,29 @@ impl From<&CodeResources> for Value {
     }
 }
 
-#[derive(Clone, Debug)]
-enum RulesEvaluation {
-    /// File should be ignored completely.
-    Exclude,
+/// Convert a relative filesystem path to its `CodeResources` normalized form.
+pub fn normalized_resources_path(path: impl AsRef<Path>) -> String {
+    // Always use UNIX style directory separators.
+    let path = path.as_ref().to_string_lossy().replace('\\', "/");
 
-    /// File isn't sealed but it is installed.
-    Omit,
+    // The Contents/ prefix is also removed for pattern matching and references in the
+    // resources file.
+    let path = path.strip_prefix("Contents/").unwrap_or(&path).to_string();
 
-    /// Seal a symlink.
-    ///
-    /// Members are the relative path and the target path.
-    SealSymlink(String, String),
+    path
+}
 
-    /// Seal a nested Mach-O binary.
-    ///
-    /// Members are the relative path and whether the rule is optional.
-    SealNested(String, bool),
-
-    /// Seal a regular file.
-    ///
-    /// Members are the relative path and whether the rule is optional.
-    SealRegularFile(String, bool),
-
-    /// File doesn't match any rules.
-    NoRule,
+/// Find the first rule matching a given path.
+///
+/// Internally, rules are sorted by decreasing priority, with exclusion
+/// rules having highest priority. So the first pattern that matches is
+/// rule we use.
+///
+/// Pattern matches are always against the normalized filename. (e.g.
+/// `Contents/` is stripped.)
+fn find_rule(rules: &[CodeResourcesRule], path: impl AsRef<Path>) -> Option<CodeResourcesRule> {
+    let path = normalized_resources_path(path);
+    rules.iter().find(|rule| rule.re.is_match(&path)).cloned()
 }
 
 /// Interface for constructing a `CodeResources` instance.
@@ -1012,11 +1021,11 @@ impl CodeResourcesBuilder {
         slf.add_rule(CodeResourcesRule::new("^version.plist$")?);
         slf.add_rule(CodeResourcesRule::new("^.*")?);
         slf.add_rule(
-            CodeResourcesRule::new("^.*\\.lproj")?
+            CodeResourcesRule::new("^.*\\.lproj/")?
                 .optional()
                 .weight(1000),
         );
-        slf.add_rule(CodeResourcesRule::new("^Base\\.lproj")?.weight(1010));
+        slf.add_rule(CodeResourcesRule::new("^Base\\.lproj/")?.weight(1010));
         slf.add_rule(
             CodeResourcesRule::new("^.*\\.lproj/locversion.plist$")?
                 .omit()
@@ -1038,7 +1047,7 @@ impl CodeResourcesBuilder {
                 .optional()
                 .weight(1000),
         );
-        slf.add_rule2(CodeResourcesRule::new("^Base\\.lproj")?.weight(1010));
+        slf.add_rule2(CodeResourcesRule::new("^Base\\.lproj/")?.weight(1010));
         slf.add_rule2(
             CodeResourcesRule::new("^.*\\.lproj/locversion.plist$")?
                 .omit()
@@ -1070,7 +1079,8 @@ impl CodeResourcesBuilder {
     /// Add an exclusion rule to the processing rules.
     ///
     /// Exclusion rules are not added to the [CodeResources] because they are
-    /// for building only.
+    /// implicit and used for filesystem traversal to influence which entities
+    /// are skipped.
     pub fn add_exclusion_rule(&mut self, rule: CodeResourcesRule) {
         self.rules.push(rule.clone());
         self.rules.sort();
@@ -1078,268 +1088,360 @@ impl CodeResourcesBuilder {
         self.rules2.sort();
     }
 
-    /// Find the first rule matching a given path.
+    /// Recursively seal a bundle directory.
     ///
-    /// Rule processing is a bit complicated. Internally, rules are sorted by
-    /// decreasing priority. So the first pattern that matches is the rule we use.
-    /// However, there are a few special cases.
+    /// This function does the heavy lifting of walking a bundle directory
+    /// and sealing the content inside.
     ///
-    /// If a path begins with `Contents/`, that prefix is ignored when performing the
-    /// pattern match.
+    /// For each filesystem entry, it finds the most appropriate registered
+    /// rule that applies to it. Then using that rule it takes actions.
     ///
-    /// Directories are special. If an exclusion rule matches a directory, that directory
-    /// tree should be ignored. There are also default rules for handling nested bundles.
-    /// These rules take precedence over directory exclusion rules.
-    fn find_rule(rules: &[CodeResourcesRule], path: &str) -> Option<CodeResourcesRule> {
-        let parts = path.split('/').collect::<Vec<_>>();
+    /// Typically, each file entity has its digest recorded/sealed.
+    ///
+    /// As a side-effect, files are copied/installed into the destination
+    /// directory as part of sealing.
+    pub fn walk_and_seal_directory(
+        &mut self,
+        root_bundle_path: &Path,
+        bundle_root: &Path,
+        context: &BundleSigningContext,
+    ) -> Result<(), AppleCodesignError> {
+        let mut skipping_rel_dirs = BTreeSet::new();
 
-        let mut exclude_override = false;
+        for entry in walkdir::WalkDir::new(bundle_root).sort_by_file_name() {
+            let entry = entry?;
+            let path = entry.path();
 
-        let rule = rules.iter().find(|rule| {
-            // Nested rules matching leaf-most directory with `.` result in match.
-            // But we treat as exclusion, as these are treated as nested bundles,
-            // which are handled externally.
-            if rule.nested {
-                for last_part in 1..parts.len() - 1 {
-                    let parent = parts[0..last_part].join("/");
-
-                    if rule.re.is_match(&parent) && parts[last_part - 1].contains('.') {
-                        exclude_override = true;
-                        return true;
-                    }
-                }
+            if path == bundle_root {
+                continue;
             }
 
-            // Directory exclusions match entire directory tree. So walk the parents and yield
-            // this rule if matches.
-            if rule.exclude {
-                for last_part in 1..parts.len() - 1 {
-                    let parent = parts[0..last_part].join("/");
+            let rel_path = path
+                .strip_prefix(bundle_root)
+                .expect("stripping path prefix should always work");
+            let root_rel_path_normalized = path
+                .strip_prefix(root_bundle_path)
+                .expect("stripping root prefix should always work")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let rel_path_normalized = normalized_resources_path(rel_path);
 
-                    if rule.re.is_match(&parent) {
-                        return true;
-                    }
-                }
+            let file_name = rel_path
+                .file_name()
+                .expect("should have final path component")
+                .to_string_lossy()
+                .to_string();
+
+            // We're excluding a parent directory. Do nothing.
+            if skipping_rel_dirs.iter().any(|p| rel_path.starts_with(p)) {
+                debug!("{} ignored because marked as skipped", rel_path.display());
+                continue;
             }
 
-            rule.re.is_match(path)
-        });
-
-        if let Some(rule) = rule {
-            let mut rule = rule.clone();
-
-            if exclude_override {
-                rule.exclude = true;
-            }
-
-            Some(rule)
-        } else {
-            None
-        }
-    }
-
-    fn evaluate_rules(
-        rules: &[CodeResourcesRule],
-        relative_path: impl AsRef<Path>,
-        symlink_target: Option<PathBuf>,
-    ) -> Result<RulesEvaluation, AppleCodesignError> {
-        // Always use UNIX style directory separators.
-        let relative_path = relative_path.as_ref().to_string_lossy().replace('\\', "/");
-
-        // The Contents/ prefix is also removed for pattern matching and references in the
-        // resources file.
-        let relative_path = relative_path
-            .strip_prefix("Contents/")
-            .unwrap_or(&relative_path)
-            .to_string();
-
-        match Self::find_rule(rules, relative_path.as_ref()) {
-            Some(rule) => {
+            // Rules version 2.
+            if let Some(rule) = find_rule(&self.rules2, rel_path) {
                 debug!(
-                    "{} matches {} rule {}",
-                    relative_path,
-                    if rule.exclude || rule.omit {
-                        "exclusion"
-                    } else {
-                        "inclusion"
-                    },
-                    rule.pattern
+                    "{}:{} matches rules2 {:?}",
+                    bundle_root.display(),
+                    rel_path.display(),
+                    rule
                 );
 
-                if rule.exclude {
-                    Ok(RulesEvaluation::Exclude)
-                } else if rule.omit {
-                    Ok(RulesEvaluation::Omit)
-                } else if rule.nested && symlink_target.is_some() {
-                    // Symlinks in nested bundles can be excluded since they should have
-                    // been processed by the nested bundle.
-                    Ok(RulesEvaluation::Exclude)
-                } else if let Some(target) = symlink_target {
-                    let target = target.to_string_lossy().replace('\\', "/");
+                if entry.file_type().is_dir() {
+                    if rule.nested {
+                        // Only treat as a nested bundle iff it has a dot in its name.
+                        if file_name.contains('.') {
+                            // We assume the bundle has already been signed because that's
+                            // how our bundle walker works. So all we need to do here is
+                            // seal the bundle. We can skip handling all files in this
+                            // directory since they've already been processed.
+                            self.seal_rules2_nested_bundle(
+                                path,
+                                rel_path,
+                                &rel_path_normalized,
+                                rule.optional,
+                                &context.dest_dir,
+                            )?;
 
-                    Ok(RulesEvaluation::SealSymlink(relative_path, target))
-                } else if rule.nested {
-                    Ok(RulesEvaluation::SealNested(relative_path, rule.optional))
+                            skipping_rel_dirs.insert(rel_path.to_path_buf());
+                        }
+                    } else if rule.exclude {
+                        info!(
+                            "{} marked as excluded in resource rules",
+                            rel_path_normalized
+                        );
+                        skipping_rel_dirs.insert(rel_path.to_path_buf());
+                    }
+
+                    // No need to do anything else since we'll walk into directory
+                    // to handle files.
+                } else if entry.file_type().is_file() {
+                    if rule.exclude {
+                        debug!("{} ignoring file due to exclude rule", rel_path_normalized);
+                        continue;
+                    }
+
+                    // Nested flag means the file should itself be signable.
+                    if rule.nested {
+                        if crate::reader::path_is_macho(path)? {
+                            info!("sealing nested Mach-O binary: {}", rel_path.display());
+
+                            self.seal_rules2_nested_macho(
+                                path,
+                                rel_path,
+                                &rel_path_normalized,
+                                &root_rel_path_normalized,
+                                context,
+                                rule.optional,
+                            )?;
+                        } else {
+                            // TODO implement this?
+                            // The logical intent is to sign and seal the nested entity.
+                            // But if we're not a directory bundle and not a Mach-O, I'm
+                            // unsure how to convey that seal. Maybe other entities like
+                            // DMG and pkg installers can have their signature digest
+                            // encapsulated in a cdhash?
+                            error!(
+                                "encountered a non Mach-O file with a nested rule: {}",
+                                rel_path.display()
+                            );
+                            error!("we do not know how to handle this scenario; either your bundle layout is invalid or you found a bug in this program");
+                            error!("if the bundle signs and verifies with Apple's tooling, consider reporting this issue");
+                        }
+                    } else {
+                        self.seal_rules2_file(
+                            path,
+                            rel_path,
+                            &rel_path_normalized,
+                            &root_rel_path_normalized,
+                            rule.omit,
+                            rule.optional,
+                            context,
+                        )?;
+                    }
+                } else if entry.file_type().is_symlink() {
+                    if rule.exclude {
+                        info!(
+                            "{} ignoring symlink due to exclude rule",
+                            rel_path_normalized
+                        );
+                        continue;
+                    }
+
+                    self.seal_rules2_symlink(
+                        path,
+                        rel_path,
+                        &rel_path_normalized,
+                        rule.omit,
+                        context,
+                    )?;
                 } else {
-                    Ok(RulesEvaluation::SealRegularFile(
-                        relative_path,
-                        rule.optional,
-                    ))
+                    warn!(
+                        "{} unexpected file type encountering during bundle signing",
+                        rel_path_normalized
+                    );
+                }
+            } else {
+                debug!(
+                    "{}:{} doesn't match any rules2 rule",
+                    bundle_root.display(),
+                    rel_path.display()
+                );
+            }
+
+            // Now rules version 1. Only regular files can be sealed. Version
+            // 1 does not support nested signatures nor symlinks.
+            if let Some(rule) = find_rule(&self.rules, rel_path) {
+                debug!(
+                    "{}:{} matches rules rule {:?}",
+                    bundle_root.display(),
+                    rel_path.display(),
+                    rule
+                );
+
+                if entry.file_type().is_file() {
+                    if rule.exclude {
+                        continue;
+                    }
+
+                    self.seal_rules1_file(path, &rel_path_normalized, rule)?;
                 }
             }
-            None => {
-                debug!("{} doesn't match any rule", relative_path);
-                Ok(RulesEvaluation::NoRule)
-            }
         }
+
+        Ok(())
     }
 
-    /// Process the `<rules2>` set for a given file.
-    fn process_file_rules2(
+    /// Seal a nested bundle for rules version 2.
+    fn seal_rules2_nested_bundle(
         &mut self,
-        file: &DirectoryBundleFile,
-        file_handler: &dyn BundleFileHandler,
+        full_path: &Path,
+        rel_path: &Path,
+        rel_path_normalized: &str,
+        optional: bool,
+        dest_dir: &Path,
     ) -> Result<(), AppleCodesignError> {
-        match Self::evaluate_rules(
-            &self.rules2,
-            file.relative_path(),
-            file.symlink_target()
-                .map_err(AppleCodesignError::DirectoryBundle)?,
-        )? {
-            RulesEvaluation::Exclude => {
-                // Excluded files are hard ignored. These files are likely handled out-of-band
-                // from this builder.
-                Ok(())
-            }
-            RulesEvaluation::Omit => {
-                // Omitted files aren't sealed. But they are installed.
-                file_handler.install_file(file)
-            }
-            RulesEvaluation::NoRule => {
-                // No rule match is assumed to mean full ignore.
-                Ok(())
-            }
-            RulesEvaluation::SealSymlink(relative_path, target) => {
-                info!("sealing symlink {} -> {}", relative_path, target);
-                self.resources.seal_symlink(relative_path, target);
-                file_handler.install_file(file)
-            }
-            RulesEvaluation::SealNested(relative_path, optional) => {
-                // The assumption that a nested match means Mach-O may not be correct.
-                info!("sealing Mach-O file {}", relative_path);
-                let macho_info = file_handler.sign_and_install_macho(file)?;
+        info!(
+            "sealing nested directory as a bundle: {}",
+            rel_path.display()
+        );
+        let bundle = DirectoryBundle::new_from_path(full_path)?;
 
-                self.resources
-                    .seal_macho(relative_path, &macho_info, optional)
-            }
-            RulesEvaluation::SealRegularFile(relative_path, optional) => {
-                info!("sealing regular file {}", relative_path);
-                let data = std::fs::read(file.absolute_path())?;
-
-                let flavor = if self.digests.contains(&DigestType::Sha1) {
-                    FilesFlavor::Rules2WithSha1
-                } else {
-                    FilesFlavor::Rules2
-                };
-
-                self.resources
-                    .seal_regular_file(flavor, relative_path, data, optional)?;
-                file_handler.install_file(file)
-            }
-        }
-    }
-
-    /// Process the `<rules>` set for a given file.
-    ///
-    /// Since `<rules2>` handling actually does the file installs, the only role of this
-    /// handler is to record the SHA-1 seals in `<files>`. Keep in mind that `<files>` can't
-    /// handle symlinks or nested Mach-O binaries. So we only care about regular files here.
-    fn process_file_rules(&mut self, file: &DirectoryBundleFile) -> Result<(), AppleCodesignError> {
-        match Self::evaluate_rules(
-            &self.rules,
-            file.relative_path(),
-            file.symlink_target()
-                .map_err(AppleCodesignError::DirectoryBundle)?,
-        )? {
-            RulesEvaluation::Exclude
-            | RulesEvaluation::Omit
-            | RulesEvaluation::NoRule
-            | RulesEvaluation::SealSymlink(..)
-            | RulesEvaluation::SealNested(..) => Ok(()),
-            RulesEvaluation::SealRegularFile(relative_path, optional) => {
-                let data = std::fs::read(file.absolute_path())?;
-
-                self.resources
-                    .seal_regular_file(FilesFlavor::Rules, relative_path, data, optional)
-            }
-        }
-    }
-
-    /// Process a file for resource handling.
-    ///
-    /// This determines whether a file is relevant for inclusion in the CodeResources
-    /// file and takes actions to process it, if necessary.
-    pub fn process_file(
-        &mut self,
-        file: &DirectoryBundleFile,
-        file_handler: &dyn BundleFileHandler,
-    ) -> Result<(), AppleCodesignError> {
-        self.process_file_rules2(file, file_handler)?;
-        self.process_file_rules(file)
-    }
-
-    /// Process a nested bundle for inclusion in resource handling.
-    ///
-    /// This will attempt to seal the main digest of the bundle into this resources file.
-    pub fn process_nested_bundle(
-        &mut self,
-        relative_path: &str,
-        bundle: &DirectoryBundle,
-    ) -> Result<(), AppleCodesignError> {
-        let main_exe = match bundle
-            .files(false)
-            .map_err(AppleCodesignError::DirectoryBundle)?
+        if let Some(nested_exe) = bundle
+            .files(false)?
             .into_iter()
-            .find(|file| matches!(file.is_main_executable(), Ok(true)))
+            .find(|f| matches!(f.is_main_executable(), Ok(true)))
         {
-            Some(path) => path,
-            None => {
-                warn!(
-                    "nested bundle at {} does not have main executable; nothing to seal",
-                    relative_path
-                );
-                return Ok(());
-            }
+            let nested_exe = dest_dir.join(rel_path).join(nested_exe.relative_path());
+
+            info!("reading Mach-O signature from {}", nested_exe.display());
+            let macho_data = std::fs::read(&nested_exe)?;
+            let macho_info = SignedMachOInfo::parse_data(&macho_data)?;
+
+            self.resources
+                .seal_macho(rel_path_normalized, &macho_info, optional)?;
+        } else {
+            warn!(
+                "could not find main executable of presumed nested bundle: {}",
+                rel_path.display()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Seal a Mach-O binary matching a nested rule.
+    fn seal_rules2_nested_macho(
+        &mut self,
+        full_path: &Path,
+        rel_path: &Path,
+        rel_path_normalized: &str,
+        root_rel_path: &str,
+        context: &BundleSigningContext,
+        optional: bool,
+    ) -> Result<(), AppleCodesignError> {
+        let macho_info = if context
+            .settings
+            .path_exclusion_pattern_matches(root_rel_path)
+        {
+            warn!(
+                "skipping signing of nested Mach-O binary because excluded by settings: {}",
+                rel_path.display()
+            );
+            warn!("(an error will occur if this binary is not already signed)");
+            warn!("(if you see an error, sign that Mach-O explicitly or remove it from the exclusion settings)");
+
+            let dest_path = context.install_file(full_path, rel_path)?;
+            let data = std::fs::read(dest_path)?;
+
+            SignedMachOInfo::parse_data(&data)?
+        } else {
+            context.sign_and_install_macho(full_path, rel_path)?.1
         };
 
-        let (relative_path, optional) =
-            match Self::evaluate_rules(&self.rules2, relative_path, None)? {
-                RulesEvaluation::SealRegularFile(relative_path, optional) => {
-                    (relative_path, optional)
-                }
-                RulesEvaluation::SealNested(relative_path, optional) => (relative_path, optional),
-                RulesEvaluation::Exclude => {
-                    info!(
-                        "excluding signing nested bundle {} because of matched resources rule",
-                        relative_path
-                    );
-                    return Ok(());
-                }
-                res => {
-                    warn!(
-                        "unexpected resource rules evaluation result for nested bundle {}: {:?}",
-                        relative_path, res
-                    );
-                    return Err(AppleCodesignError::BundleUnexpectedResourceRuleResult);
-                }
+        self.resources
+            .seal_macho(rel_path_normalized, &macho_info, optional)
+    }
+
+    /// Seal a file for version 2 rules.
+    fn seal_rules2_file(
+        &mut self,
+        full_path: &Path,
+        rel_path: &Path,
+        rel_path_normalized: &str,
+        root_rel_path: &str,
+        omit: bool,
+        optional: bool,
+        context: &BundleSigningContext,
+    ) -> Result<(), AppleCodesignError> {
+        let mut need_install = true;
+
+        // Only seal if the omit flag is unset. But install unconditionally
+        // in all cases.
+        if !omit {
+            // Unlike Apple's tooling, we recognize Mach-O binaries when the nested
+            // flag isn't set and we automatically sign.
+            //
+            // When we seal the file, we treat it as a regular file since the
+            // nested flag isn't set. Note that we need to read the signed/installed
+            // version of the file since signing will change its content.
+
+            let read_path = if crate::reader::path_is_macho(full_path)?
+                && !context
+                    .settings
+                    .path_exclusion_pattern_matches(root_rel_path)
+            {
+                info!(
+                    "non-nested file is a Mach-O binary; signing accordingly {}",
+                    rel_path.display()
+                );
+                need_install = false;
+                context.sign_and_install_macho(full_path, rel_path)?.0
+            } else {
+                info!("sealing regular file {}", rel_path_normalized);
+                full_path.to_path_buf()
             };
 
-        let macho_data = std::fs::read(main_exe.absolute_path())?;
-        let macho_info = SignedMachOInfo::parse_data(&macho_data)?;
+            let digests = MultiDigest::from_path(read_path)?;
 
-        info!("sealing nested bundle at {}", relative_path);
-        self.resources
-            .seal_macho(relative_path, &macho_info, optional)?;
+            let flavor = if self.digests.contains(&DigestType::Sha1) {
+                FilesFlavor::Rules2WithSha1
+            } else {
+                FilesFlavor::Rules2
+            };
+
+            self.resources
+                .seal_regular_file(flavor, rel_path_normalized, digests, optional)?;
+        }
+
+        if need_install {
+            context.install_file(full_path, rel_path)?;
+        }
+
+        Ok(())
+    }
+
+    fn seal_rules2_symlink(
+        &mut self,
+        full_path: &Path,
+        rel_path: &Path,
+        rel_path_normalized: &str,
+        omit: bool,
+        context: &BundleSigningContext,
+    ) -> Result<(), AppleCodesignError> {
+        let link_target = std::fs::read_link(full_path)?
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if !omit {
+            info!("sealing symlink {} -> {}", rel_path_normalized, link_target);
+            self.resources
+                .seal_symlink(rel_path_normalized, link_target);
+        }
+        context.install_file(full_path, rel_path)?;
+
+        Ok(())
+    }
+
+    /// Perform sealing activity for an entry in rules v1.
+    fn seal_rules1_file(
+        &mut self,
+        full_path: &Path,
+        rel_path_normalized: &str,
+        rule: CodeResourcesRule,
+    ) -> Result<(), AppleCodesignError> {
+        // Version 1 doesn't handle symlinks nor nested Mach-O binaries.
+        // And version 2's handler installed files. So all we have to do here
+        // is record SHA-1 digests in `<files>`.
+
+        let digests = MultiDigest::from_path(full_path)?;
+
+        self.resources.seal_regular_file(
+            FilesFlavor::Rules,
+            rel_path_normalized,
+            digests,
+            rule.optional,
+        )?;
 
         Ok(())
     }

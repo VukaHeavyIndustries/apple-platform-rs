@@ -6,6 +6,27 @@
 
 Released on ReleaseDate.
 
+* XROS support. `Platform` enumeration added `XrOs` and `XrOsSimulator`
+  variants. The `aarch64-apple-xros-sim` and `*-apple-xros` triples are
+  now recognized as XROS.
+
+## 0.5.2
+
+Released on 2023-12-22.
+
+* Fixed repository URL in README.md.
+
+## 0.5.1
+
+Released on 2023-11-09.
+
+## 0.5.0
+
+Released on 2023-11-06.
+
+* Change `PlatformDirectory` and `SdkVersion` `partial_cmp()` to be
+  implemented in terms of `cmp()`. Should have no visible effects.
+
 ## 0.4.0
 
 Released on 2022-12-21.

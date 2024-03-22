@@ -30,6 +30,7 @@ use {
         CapturedX509Certificate, KeyAlgorithm, KeyInfoSigner, Sign, Signature, SignatureAlgorithm,
         X509CertificateError,
     },
+    zeroize::Zeroizing,
 };
 
 const SYSTEM_ROOTS_KEYCHAIN: &str = "/System/Library/Keychains/SystemRootCertificates.keychain";
@@ -141,19 +142,21 @@ impl Sign for KeychainCertificate {
     }
 
     fn signature_algorithm(&self) -> Result<SignatureAlgorithm, X509CertificateError> {
-        Ok(self.captured.signature_algorithm().ok_or(
-            X509CertificateError::UnknownSignatureAlgorithm(format!(
+        self.captured
+            .signature_algorithm()
+            .ok_or(X509CertificateError::UnknownSignatureAlgorithm(format!(
                 "{:?}",
                 self.captured.signature_algorithm_oid()
-            )),
-        )?)
+            )))
     }
 
-    fn private_key_data(&self) -> Option<Vec<u8>> {
+    fn private_key_data(&self) -> Option<Zeroizing<Vec<u8>>> {
         None
     }
 
-    fn rsa_primes(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, X509CertificateError> {
+    fn rsa_primes(
+        &self,
+    ) -> Result<Option<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)>, X509CertificateError> {
         Ok(None)
     }
 }

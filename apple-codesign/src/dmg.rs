@@ -46,9 +46,8 @@ and invalidate prior signatures.
 use {
     crate::{
         code_directory::{CodeDirectoryBlob, CodeSignatureFlags},
-        embedded_signature::{
-            BlobData, CodeSigningSlot, Digest, DigestType, EmbeddedSignature, RequirementSetBlob,
-        },
+        cryptography::{Digest, DigestType},
+        embedded_signature::{BlobData, CodeSigningSlot, EmbeddedSignature, RequirementSetBlob},
         embedded_signature_builder::EmbeddedSignatureBuilder,
         AppleCodesignError, SettingsScope, SigningSettings,
     },
@@ -345,6 +344,7 @@ impl DmgSigner {
                 signing_cert,
                 settings.time_stamp_url(),
                 settings.certificate_chain().iter().cloned(),
+                settings.signing_time(),
             )?;
         }
 
@@ -383,18 +383,18 @@ impl DmgSigner {
 
         warn!("using identifier {}", ident);
 
-        let code_hashes = vec![reader.digest_content_with(*settings.digest_type(), fh)?];
+        let digest_type = settings.digest_type(SettingsScope::Main);
 
-        let koly_digest = reader
-            .koly()
-            .digest_for_code_directory(*settings.digest_type())?;
+        let code_hashes = vec![reader.digest_content_with(digest_type, fh)?];
+
+        let koly_digest = reader.koly().digest_for_code_directory(digest_type)?;
 
         let mut cd = CodeDirectoryBlob {
             version: 0x20100,
             flags,
             code_limit: reader.koly().offset_after_plist() as u32,
-            digest_size: settings.digest_type().hash_len()? as u8,
-            digest_type: *settings.digest_type(),
+            digest_size: digest_type.hash_len()? as u8,
+            digest_type,
             page_size: 1,
             ident,
             code_digests: code_hashes,

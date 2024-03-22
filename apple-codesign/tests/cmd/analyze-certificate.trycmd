@@ -9,57 +9,79 @@ The output of the command can be useful to learn about X.509 certificate extensi
 Usage: rcodesign[EXE] analyze-certificate [OPTIONS]
 
 Options:
-      --smartcard-slot <SMARTCARD_SLOT>
+  -C, --config-file <CONFIG_PATH>
+          Explicit configuration file to load.
+          
+          If provided, the default configuration files are not loaded, even if they exist.
+          
+          Can be specified multiple times. Files are loaded/merged in the order given.
+          
+          The special value `/dev/null` can be used to specify an empty/null config file. It can be used to short-circuit loading of default config files.
+
+      --smartcard-slot <SLOT>
           Smartcard slot number of signing certificate to use (9c is common)
+
+  -P, --profile <PROFILE>
+          Configuration profile to load.
+          
+          If not specified, the implicit "default" profile is loaded.
+
+      --smartcard-pin <SECRET>
+          Smartcard PIN used to unlock certificate
+          
+          If not provided, you will be prompted for a PIN as necessary.
+
+      --smartcard-pin-env <STRING>
+          Environment variable holding the smartcard PIN
 
   -v, --verbose...
           Increase logging verbosity. Can be specified multiple times
 
-      --smartcard-pin-env <SMARTCARD_PIN_ENV>
-          Environment variable holding the smartcard PIN
-
-      --keychain-domain <KEYCHAIN_DOMAIN>
+      --keychain-domain <DOMAIN>
           (macOS only) Keychain domain to operate on
           
           [possible values: user, system, common, dynamic]
 
-      --keychain-fingerprint <KEYCHAIN_FINGERPRINT>
+      --keychain-fingerprint <SHA256 FINGERPRINT>
           (macOS only) SHA-256 fingerprint of certificate in Keychain to use
 
-      --pem-source <PEM_SOURCE>
+      --windows-store-name <STORE>
+          (Windows only) Windows Store to operate on
+          
+          [possible values: user, machine, service]
+
+      --windows-store-sha1-fingerprint <SHA1 FINGERPRINT>
+          (Windows only) SHA-1 fingerprint of certificate in Windows Store to use
+
+      --pem-file <PATH>
           Path to file containing PEM encoded certificate/key data
 
-      --der-source <DER_SOURCE>
-          Path to file containing DER encoded certificate data
-
-      --p12-file <P12_PATH>
+      --p12-file <PATH>
           Path to a .p12/PFX file containing a certificate key pair
 
-      --p12-password <P12_PASSWORD>
+      --p12-password <SECRET>
           The password to use to open the --p12-file file
 
-      --p12-password-file <P12_PASSWORD_FILE>
+      --p12-password-file <PATH>
           Path to file containing password for opening --p12-file file
 
-      --remote-signer
-          Send signing requests to a remote signer
+      --remote-signing-url <URL>
+          URL of a remote code signing server
 
-      --remote-public-key <REMOTE_PUBLIC_KEY>
+      --remote-public-key <BASE64 ENCODED PUBLIC KEY>
           Base64 encoded public key data describing the signer
 
-      --remote-public-key-pem-file <REMOTE_PUBLIC_KEY_PEM_FILE>
+      --remote-public-key-pem-file <PATH>
           PEM encoded public key data describing the signer
 
-      --remote-shared-secret <REMOTE_SHARED_SECRET>
+      --remote-shared-secret <SECRET>
           Shared secret used for remote signing
 
-      --remote-shared-secret-env <REMOTE_SHARED_SECRET_ENV>
+      --remote-shared-secret-env <ENV VAR NAME>
           Environment variable holding the shared secret used for remote signing
 
-      --remote-signing-url <REMOTE_SIGNING_URL>
-          URL of a remote code signing server
-          
-          [default: wss://ws.codesign.gregoryszorc.com/]
+      --certificate-der-file <PATH>
+          Path to file containing DER encoded certificate data
 
   -h, --help
           Print help (see a summary with '-h')
@@ -69,9 +91,9 @@ Options:
 ```
 $ rcodesign analyze-certificate --keychain-domain user --keychain-fingerprint fingerprint
 ? 2
-error: the argument '--keychain-domain <KEYCHAIN_DOMAIN>' cannot be used with '--keychain-fingerprint <KEYCHAIN_FINGERPRINT>'
+error: the argument '--keychain-domain <DOMAIN>' cannot be used with '--keychain-fingerprint <SHA256 FINGERPRINT>'
 
-Usage: rcodesign[EXE] analyze-certificate --keychain-domain <KEYCHAIN_DOMAIN>
+Usage: rcodesign[EXE] analyze-certificate --keychain-domain <DOMAIN>
 
 For more information, try '--help'.
 
@@ -80,9 +102,9 @@ For more information, try '--help'.
 ```
 $ rcodesign analyze-certificate --p12-password foo --p12-password-file path
 ? 2
-error: the argument '--p12-password <P12_PASSWORD>' cannot be used with '--p12-password-file <P12_PASSWORD_FILE>'
+error: the argument '--p12-password <SECRET>' cannot be used with '--p12-password-file <PATH>'
 
-Usage: rcodesign[EXE] analyze-certificate --p12-password <P12_PASSWORD>
+Usage: rcodesign[EXE] analyze-certificate --p12-password <SECRET>
 
 For more information, try '--help'.
 
@@ -91,9 +113,9 @@ For more information, try '--help'.
 ```
 $ rcodesign analyze-certificate --remote-public-key foo --remote-public-key-pem-file path
 ? 2
-error: the argument '--remote-public-key <REMOTE_PUBLIC_KEY>' cannot be used with '--remote-public-key-pem-file <REMOTE_PUBLIC_KEY_PEM_FILE>'
+error: the argument '--remote-public-key <BASE64 ENCODED PUBLIC KEY>' cannot be used with '--remote-public-key-pem-file <PATH>'
 
-Usage: rcodesign[EXE] analyze-certificate --remote-public-key <REMOTE_PUBLIC_KEY>
+Usage: rcodesign[EXE] analyze-certificate --remote-public-key <BASE64 ENCODED PUBLIC KEY>
 
 For more information, try '--help'.
 
@@ -102,9 +124,9 @@ For more information, try '--help'.
 ```
 $ rcodesign analyze-certificate --remote-shared-secret secret --remote-shared-secret-env env
 ? 2
-error: the argument '--remote-shared-secret <REMOTE_SHARED_SECRET>' cannot be used with '--remote-shared-secret-env <REMOTE_SHARED_SECRET_ENV>'
+error: the argument '--remote-shared-secret <SECRET>' cannot be used with '--remote-shared-secret-env <ENV VAR NAME>'
 
-Usage: rcodesign[EXE] analyze-certificate --remote-shared-secret <REMOTE_SHARED_SECRET>
+Usage: rcodesign[EXE] analyze-certificate --remote-shared-secret <SECRET>
 
 For more information, try '--help'.
 
@@ -121,6 +143,8 @@ Subject is Issuer?:          false
 Team ID:                     MK22MZP987
 SHA-1 fingerprint:           d6b1f9320ce2cc552ad34f05b7fd29a62a047e87
 SHA-256 fingerprint:         7bf474b50849b231c4524731de63fa035c434ce68589db7b3c22e3d04f1dab7e
+Not Valid Before:            2021-04-22T01:08:32+00:00
+Not Valid After:             2026-04-23T01:08:31+00:00
 Key Algorithm:               RSA
 Signature Algorithm:         SHA-256 with RSA encryption
 Public Key Data:             MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs52TZuX8/9SVXNBr6Vz5CZOmis3lCpRsSP6pKPnIfK46DlOSoob6u/wALiPKOZJOYKnnbHuJ1pjvFEHif/eJkdfovu82bwAMJnFrbCGBHmOsqfuURfc5cfaIcpred9P0mFUVpu194n74ZR2sjxJIFIMxJXgh7dSE4dKKokf/o5Orlb3d84i1/yY/ePSdnFIMotxrv0lvuZjdlIZE6ugoElueSyH1ZwF03UqQznJ1uuw1DSRyC0YD2l7paO+CKKpHAvsTSAZcj4X6qwx+aVgxiYcfl1z6nVDVv1m6+ChAOGyo06KpGPxFeON/Dp704UJyfyrRF7xDIf/Cu+2ftMlLswIDAQAB
@@ -132,7 +156,6 @@ Apple Issuing Chain:
 Guessed Certificate Profile: DeveloperIdApplication
 Is Apple Root CA?:           false
 Is Apple Intermediate CA?:   false
-Apple CA Extension:          none
 Apple Extended Key Usage Purpose Extensions:
   - 1.3.6.1.5.5.7.3.3 (CodeSigning)
 Apple Code Signing Extensions:
@@ -197,6 +220,8 @@ Subject is Issuer?:          false
 Team ID:                     MK22MZP987
 SHA-1 fingerprint:           d6b1f9320ce2cc552ad34f05b7fd29a62a047e87
 SHA-256 fingerprint:         7bf474b50849b231c4524731de63fa035c434ce68589db7b3c22e3d04f1dab7e
+Not Valid Before:            2021-04-22T01:08:32+00:00
+Not Valid After:             2026-04-23T01:08:31+00:00
 Key Algorithm:               RSA
 Signature Algorithm:         SHA-256 with RSA encryption
 Public Key Data:             MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs52TZuX8/9SVXNBr6Vz5CZOmis3lCpRsSP6pKPnIfK46DlOSoob6u/wALiPKOZJOYKnnbHuJ1pjvFEHif/eJkdfovu82bwAMJnFrbCGBHmOsqfuURfc5cfaIcpred9P0mFUVpu194n74ZR2sjxJIFIMxJXgh7dSE4dKKokf/o5Orlb3d84i1/yY/ePSdnFIMotxrv0lvuZjdlIZE6ugoElueSyH1ZwF03UqQznJ1uuw1DSRyC0YD2l7paO+CKKpHAvsTSAZcj4X6qwx+aVgxiYcfl1z6nVDVv1m6+ChAOGyo06KpGPxFeON/Dp704UJyfyrRF7xDIf/Cu+2ftMlLswIDAQAB
@@ -208,7 +233,6 @@ Apple Issuing Chain:
 Guessed Certificate Profile: DeveloperIdApplication
 Is Apple Root CA?:           false
 Is Apple Intermediate CA?:   false
-Apple CA Extension:          none
 Apple Extended Key Usage Purpose Extensions:
   - 1.3.6.1.5.5.7.3.3 (CodeSigning)
 Apple Code Signing Extensions:
@@ -276,6 +300,8 @@ Subject is Issuer?:          true
 Team ID:                     <missing>
 SHA-1 fingerprint:           b1c7f1807bb9eb61ab3d13b0ffc12a363311dbd2
 SHA-256 fingerprint:         f2e635017332bcb96b44f8cc65c07f5141f5932599e706f66023314adf8b9d07
+Not Valid Before:            2021-04-22T21:51:28+00:00
+Not Valid After:             2022-04-22T21:51:28+00:00
 Key Algorithm:               RSA
 Signature Algorithm:         SHA-256 with RSA encryption
 Public Key Data:             MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApp0SntOtH7dgkQ1jIKrzgjW58VxqbRXpz/5sQp6AIulGS87IWMjLd/9k0+3X9+fKypMPADnbMb6CX3KgbKCJSNc2SI/g4tVg1HTo2wuVNpe1o/LaKMRZY+u/KvZBsN6gAtspayZAxYCSBxEQ7JndHq57Z+ZK4o/yT5LftOJ+LpJQk7pBMPbW6uHmYZWOMH119i7VBEtBNZhwwloAX7DlFGWBG3NtJ4HBTxwSvNkCNG04a+HK9OFuSO1vfYy5/6OqmQ5sKjgkEBWrud9TPp5hWCzrx0cGGYWprMDQ6ix2pCVp9dToecYiZOpNhgSAxioHU317M4Pf060tDUmsBBnykQIDAQAB
@@ -283,7 +309,6 @@ Signed by Apple?:            false
 Guessed Certificate Profile: none
 Is Apple Root CA?:           false
 Is Apple Intermediate CA?:   false
-Apple CA Extension:          none
 Apple Extended Key Usage Purpose Extensions:
   - 1.3.6.1.5.5.7.3.3 (CodeSigning)
 Apple Code Signing Extensions:

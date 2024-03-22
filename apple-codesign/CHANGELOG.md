@@ -6,29 +6,287 @@
 
 Released on ReleaseDate.
 
+## 0.27.0
+
+Released on 2024-01-17.
+
+* Published a
+  [GitHub Action for code signing and notarization](https://github.com/marketplace/actions/apple-code-signing)
+  and wrote project documentation for how to use it. (#6)
+* Fix to restore working builds with `--no-default-features`.
+* Added `notary-list` command to print information about recently submitted
+  notarizations to Apple. (#124)
+* Fixed a bug where `.dSYM/` directories were incorrectly signed as
+  bundles. (#128)
+* The `sign` command has gained a `--shallow` argument to prevent traversing into
+  nested entities when signing. It currently only prevents traversal into nested
+  bundles. In the future, behavior may be expanded to also exclude signing of
+  additional Mach-O binaries inside bundles, among other potential changes.
+  Ultimately we want this signing mode to converge with the default behavior of
+  Apple's tooling.
+* The `sign` command has gained a `--for-notarization` argument that attempts to
+  engage and enforce signing settings required for Apple notarization. The goal
+  of the feature is to cut down on notarization failures after successful
+  signing operations. If you encounter a notarization failure when using this
+  new flag, consider filing a bug report.
+* (API) `BundleSigner` now requires calling `collect_nested_bundles()` to register
+  child bundles for signing instead of signing all nested bundles by default.
+* aws-config 0.57 -> 1.1.
+* aws-sdk-s3 0.36 -> 1.10.
+* aws-smithy-http 0.57 -> 0.60.
+* aws-smithy-types 0.57 -> 1.1.
+* goblin 0.7 -> 0.8.
+* scroll 0.11 -> 0.12.
+* tungstenite 0.20 -> 0.21.
+* windows-sys 0.48 -> 0.52.
+
+## 0.26.0
+
+Released on 2023-11-17.
+
+* (New feature) On Windows, it is now possible to sign with code signing
+  certificates stored in the Windows Certificate Store. The `sign` command
+  (and other commands taking certificate sources) gained `--windows-store-name`
+  and `--windows-store-sha1-fingerprint` arguments to specify a certificate in
+  the Windows Certificate Store to use. New commands
+  `windows-store-print-certificates` and
+  `windows-store-export-certificate-chain` can discover and export certificates
+  in the Windows Certificate Store. Feature contributed by El Mostafa Idrassi
+  in #111.
+* Fixed a bug where a `signing without an Apple signed certificate but signing
+  settings contain a team name` warning was printed incorrectly.
+* We now print a warning when signing using an expired certificate.
+* Fixed a bug where `sign --code-signature-flags` could not be scoped. (#116)
+
+## 0.25.1
+
+Released on 2023-11-16.
+
+* (Breaking change) The `sign --remote-signer` argument has been removed. It
+  is now implicitly assumed via presence of a remote session initialization
+  argument.
+* Fixed a regression in 0.25.0 where remote signing didn't work due argument
+  parsing errors.
+
+## 0.25.0
+
+Released on 2023-11-15.
+
+(Binary assets for this release were never formally published due to a
+regression in remote signing CLI argument handling.)
+
+* (Breaking change) The `--extra-digest` argument has been removed.
+  `--digest` can now be specified multiple times. `--digest` is now a
+  scoped value.
+* (Breaking change) Various signing settings no longer inherit to nested
+  entities: `--entitlements-xml-file`, `--code-requirements-file`,
+  `--code-resources-file`, `--code-signature-flags`, and `--info-plist-file`.
+  The new behavior is much more conservative about which signing settings
+  can be inherited and prevents unexpected results, such as all binaries
+  in a bundle sharing the same entitlements or signing flags. Previous signers
+  of bundles may find various signing settings disappearing from nested
+  bundles or the non-main Mach-O binary within a bundle. It is highly encouraged
+  to use the `rcodesign diff-signatures` command to compare results. If settings
+  were dropped, add new scoped CLI arguments or use the new configuration
+  file feature to add settings back in to specific paths.
+* (New feature) Configuration file support added. TOML based configuration
+  files can now define signers and signing settings in named *profiles*,
+  allowing for automatic and near effortless reuse of common configurations.
+  See the documentation for more.
+* (New feature) Environment constraints support. We now support defining launch
+  constraints and library constraints. We don't yet fully understand the
+  interactions of constraints and code signing. If using constraints, we
+  highly recommend comparing signature output with Apple's tooling to validate
+  similar behavior. If you notice discrepancies, please file a GitHub issue!
+  (#83)
+* Detection of nested bundles now looks for `CFBundlePackageType` or
+  `CFBundleIdentifier` in bundle `Info.plist` and ignores *bundles*
+  lacking these. As a result, we no longer attempt signing of storybook
+  *bundles* and other non-signable bundle-looking directories and no
+  longer likely encounter errors in the process. (#38)
+* CLI arguments for paths are now consistently named `--foo-file`
+  instead of using a mix of `--foo-path`, `--foo-filename`, and
+  potentially other variants. The old names are still recognized as
+  aliases to maintain backwards compatibility.
+* Changed heuristic for naming a binary identifier from its path to be
+  more similar to Apple's. e.g. `foo1.2.dylib` will now resolve to `foo1`
+  instead of `foo1.2`. We still don't use the binary UUID or digest of its
+  load commands to compute the binary identifier like Apple does.
+* When signing nested Mach-O binaries in a bundle, we now set the binary
+  identifier from the filename rather than preserving the identifier in an
+  existing signature. This helps ensure identifiers stay in sync and prevents
+  bad signatures. (#109)
+* `print-signature-info` now prints the entitlements plist decoded from DER.
+  (#75)
+* We no longer obtain placeholder time-stamp tokens when estimating the size
+  of embedded signatures. Instead, we statically reserve 8192 bytes for the
+  token. This may cause signatures to increase in size by a few kilobytes,
+  as Apple's TSTs are ~4200 bytes. Signing should now be faster since we avoid
+  an excessive network roundtrip. (#4)
+
+## 0.24.0
+
+Released on 2023-11-09.
+
+* Add a `macho-universal-create` command to assemble single-arch Mach-O
+  binaries into a single multi-arch / universal / fat binary. The command
+  can be used as a replacement for Apple's `lipo -create`.
+* When signing bundles, the `CodeResources` file for nested Mach-O binaries
+  now emits the code directory hashes for every code directory. Before, if
+  a Mach-O contained both SHA-1 and SHA-256 code directories, only the
+  SHA-256 hash would be emitted. The new behavior matches Apple's tooling.
+  (#95)
+* The `generate-self-signed-certificate` command has gained the `--p12-file`
+  and `--p12-password` arguments to write a self-signed certificate to a
+  PKCS#12 / p12 / PFX file.
+* The `generate-self-signed-certificate` command now supports generating
+  RSA certificates. RSA certificates are now the default, to match what
+  Apple uses by default.
+* Reworked how code requirements expressions are automatically derived.
+  This should result in self-signed certificates having correct requirements
+  expressions that no longer imply they were signed by Apple's CAs. In
+  addition, some Apple signing certificates should now opt into using a
+  more appropriate code requirements expression than before. This may have
+  fixed validation errors with some signatures. (#99)
+* Team name is no longer included in signature when signing with a non
+  Apple signed certificate. This matches the behavior of Apple's tools. (#101)
+* Fixed a bug where the `AnchorCertificateHash` code requirements expression
+  was being incorrectly formatted as `anchor <slot> H"<hash>"` instead of
+  `certificate <slot> = H"<hash>"`.
+* Added awareness of new Apple CA certificates:
+  `Apple Application Integration CA 7 - G1 Certificate`,
+  `Worldwide Developer Relations - G7`, and `Worldwide Developer Relations - G8`.
+* `print-signature-info` now prints some integer values as strings containing
+  both the integer and hex forms. Additional fields are added to help debug
+  signature writing.
+* Conflicting binary identifiers within a universal Mach-O are now reconciled
+  to the initially seen value. This matches the behavior of Apple's tooling
+  and fixes a bug where drift between the values could cause bundle validation
+  to fail. (#103)
+* Fixed a bug where bundle signing would fail to overwrite preexisting state
+  in Mach-O binaries, leading to failed signature verification. This likely
+  only occurred when attempting to re-sign already signed binaries. (#104)
+* When signing bundles, non Mach-O resources files are no longer fully buffered
+  in memory to compute their content digests. This can drastically cut down
+  on memory usage when signing large resources files. Mach-O binaries are
+  still fully buffered in memory. (#45)
+* Removed `verify` warning about insecure code digests. The warning was spurious
+  and didn't take into account the nuanced logic for emitting SHA-1 digests.
+  (#50)
+* cryptographic-message-syntax 0.25 -> 0.26.
+* x509-certificate 0.22 -> 0.23.
+
+## 0.23.0
+
+Released on 2023-11-06.
+
 * Notarization features are now optional and can be controlled via the
   enabled-by-default `notarize` crate feature. (#78)
-* Minimum supported Rust version changed from 1.62.1 to 1.65.0.
+* Minimum supported Rust version changed from 1.62.1 to 1.70.0.
 * CLI argument parsing has been rewritten to use clap's derive mode
   instead of the builder mode. The intent was to mostly preserve existing
   CLI behavior. However, some minor changes - possibly bugs - may have
   occurred as a result of this refactor.
-* cryptographic-message-syntax 0.19 -> 0.23.
-* once_cell 1.16 -> 1.17.
-* p256 0.11 -> 0.13.
-* rsa 0.7 -> 0.8.
-* signature 1.6 -> 2.0.
-* x509-certificate 0.16 -> 0.20.
-* aws crates 0.53 -> 0.55.
-* dirs 4.0 -> 5.0.
+* `AppleCodesignError::AwsS3Error` now stores a `Box<T>`.
+* Added a hidden `debug-create-macho` command for generating Mach-O files.
+  The command (and new code behind it) is intended to facilitate writing
+  tests of Mach-O signing.
+* Added a hidden `debug-create-info-plist` command for generating Info.plist
+  files. The command is intended to be used to facilitate testing.
+* The `--code-signature-flags` argument of the `sign` command now correctly
+  applies multiple values. Before, flags were set to the final specified
+  value.
+* Added several trycmd based tests for testing CLI and signing behaviors.
+  The trycmd tests may download a prebuilt Rust coreutils binary from
+  github.com when executing on platforms with prebuilt binaries.
+* The `--data` argument of the `extract` command is now a positional argument.
+* Added a hidden `debug-create-code-requirements` command for generating
+  binary code requirements files. The command is intended to facilitate testing.
+* The `print-signature-info` command should now work on bundles. It may have
+  stopped working as part of an upgrade to `serde_yaml`. The YAML output may
+  have changed slightly.
+* `CodeResources` files now emit `"` instead of `&quot;` for parity with Apple
+  tooling.
+* SHA-1 digests are now automatically enabled when signing a Mach-O binary
+  without platform targeting. This mimics the behavior of Apple's tooling.
+  Before, we would only automatically activate SHA-1 digests when there was
+  a Mach-O load command targeting a too-old platform version which didn't
+  support SHA-256 digests.
+* An empty CMS blob is now automatically added when signing in ad-hoc mode.
+  Before, no CMS blob would be present. The new behavior matches that of
+  Apple's tooling.
+* Code signature data is now aligned to 16 byte boundaries in Mach-O binaries.
+  This matches the behavior of Apple tooling.
+* HTTP requests now use the operating system's trusted X.509 certificates
+  instead of a default set (based off Mozilla's maintained list). This should
+  allow connections to HTTP proxies using custom/private certificate authorities
+  to work, assuming certificates are installed on the local system. (#85)
+* Added a hidden `debug-create-entitlements` command for generating entitlements
+  plist files. The command is intended to facilitate testing.
+* The `print-signature-info` command YAML output now encodes entitlements XML
+  as an array of strings for easier readability.
+* A custom signing time can now be specified to force using a specific
+  time instead of the current time. The CMS signing and settings APIs have
+  changed accordingly. The `sign` command now accepts a `--signing-time`
+  argument to control the signing time.
+* The `generate-self-signed-certificate` command gained a
+  `--pem-unified-filename` argument to write a PEM encoded file containing
+  both the private key and public certificate.
+* Fixed a bug where files would be identified as Mach-O when they weren't.
+* Bundle signing logic has been significantly overhauled to hopefully make
+  it conform with Apple tooling's behavior. This likely fixed several bugs
+  with bundle signing.
+* Fixed a bundle signing bug where overwriting symlinks would incorrectly
+  result in an `Error: I/O error: File exists (os error 17)` or similar.
+* When signing bundles, symlinks in directories marked as *nested* should
+  now get properly sealed and installed. (#10)
+* When signing bundles, Mach-O binaries outside of *nested* directories
+  (e.g. `Libraries/libFoo.dylib`) are automatically detected as Mach-O
+  binaries and signed. This behavior conforms with our stated behavior of
+  recursively signing all signable entities. However, it is incompatible
+  with Apple's tooling, which only signs Mach-O binaries located in
+  specific directories having the *nested* flag set. This change should
+  result in *it just works* single command signing of many complex
+  bundles.
+* Added a hidden `debug-file-tree` command to print simple directory
+  trees. The command is used by snapshot tests to validate bundle signing
+  behavior.
+* The CLI default log level has been changed to `warn`. As a result,
+  command output is less verbose. `-v` restores the prior behavior. And
+  `-vvv` is now needed to activate `trace` logging (previously `-vv` was
+  the highest log level).
+* The `sign --exclude` argument is now honored for Mach-O binaries within
+  bundles. Previously, it only applied to bundle paths.
+* The default `CodeResources` rules for bundles lacking a `Resources/`
+  now properly have trailing `/` on rules referencing `.lproj` directories.
+  Previously, these directories were likely not handled correctly. (#42)
+* Fixed a bug where attempting to sign Mach-O binaries having a `__TEXT` segment
+  whose start offset was >0 resulted in a `Mach-O segment corruption` error.
+  We can now properly sign such files. (#91)
+* `verify` command now errors if not given the path of a Mach-O binary.
+* `verify` command now prints a warning that its known to be buggy.
+* aws crates 0.53 -> 0.57.
 * bitflags 1.3 -> 2.0.
+* cryptographic-message-syntax 0.19 -> 0.25.
+* dialoguer 0.10 -> 0.11.
+* dirs 4.0 -> 5.0.
 * elliptic-curve 0.12 -> 0.13.
-* pem 1.1 -> 2.0.
+* goblin 0.6 -> 0.7.
+* minicbor 0.19 -> 0.20.
+* once_cell 1.16 -> 1.17.
 * pkcs1 0.4 -> 0.7.
+* p256 0.11 -> 0.13.
+* pem 1.1 -> 3.0.
 * pkcs8 0.9 -> 0.10.
-* rasn 0.6 -> 0.7.
+* rasn 0.6 -> 0.11.
+* ring 0.16 -> 0.17.
+* rsa 0.7 -> 0.9.
+* signature 1.6 -> 2.0.
+* spake2 0.3 -> 0.4.
 * spki 0.6 -> 0.7.
-* tungstenite 0.18 -> 0.19.
+* tungstenite 0.18 -> 0.20.
+* x509-certificate 0.16 -> 0.22.
+* yubikey 0.7 -> 0.8.
 
 ## 0.22.0
 

@@ -24,12 +24,12 @@
 use {
     crate::{
         code_directory::CodeDirectoryBlob,
-        embedded_signature::{CodeSigningSlot, DigestType, EmbeddedSignature},
+        embedded_signature::{CodeSigningSlot, EmbeddedSignature},
         error::AppleCodesignError,
         macho::{MachFile, MachOBinary},
     },
     cryptographic_message_syntax::{CmsError, SignedData},
-    std::path::{Path, PathBuf},
+    std::path::PathBuf,
     x509_certificate::{DigestAlgorithm, SignatureAlgorithm},
 };
 
@@ -57,7 +57,6 @@ pub enum VerificationProblemType {
     CmsOldDigestAlgorithm(DigestAlgorithm),
     CmsOldSignatureAlgorithm(SignatureAlgorithm),
     NoCodeDirectory,
-    CodeDirectoryOldDigestAlgorithm(DigestType),
     CodeDigestError(AppleCodesignError),
     CodeDigestMissingEntry(usize, Vec<u8>),
     CodeDigestExtraEntry(usize, Vec<u8>),
@@ -109,9 +108,6 @@ impl std::fmt::Display for VerificationProblem {
                 format!("insecure signature algorithm used: {alg:?}")
             }
             VerificationProblemType::NoCodeDirectory => "no code directory".to_string(),
-            VerificationProblemType::CodeDirectoryOldDigestAlgorithm(hash_type) => {
-                format!("insecure digest algorithm used in code directory: {hash_type:?}")
-            }
             VerificationProblemType::CodeDigestError(e) => {
                 format!("error computing code digests: {e:?}")
             }
@@ -165,31 +161,6 @@ impl std::fmt::Display for VerificationProblem {
             None => f.write_str(&message),
         }
     }
-}
-
-/// Verifies a binary in a given path.
-///
-/// Returns a vector of problems detected. An empty vector means no
-/// problems were found.
-pub fn verify_path(path: impl AsRef<Path>) -> Vec<VerificationProblem> {
-    let path = path.as_ref();
-
-    let context = VerificationContext {
-        path: Some(path.to_path_buf()),
-        fat_index: None,
-    };
-
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(e) => {
-            return vec![VerificationProblem {
-                context,
-                problem: VerificationProblemType::IoError(e),
-            }];
-        }
-    };
-
-    verify_macho_data_internal(data, context)
 }
 
 /// Verifies unparsed Mach-O data.
@@ -276,7 +247,7 @@ fn verify_macho_internal(
     }
 
     // Signature data should be the last data in the __LINKEDIT segment.
-    if signature_data.signature_end_offset != signature_data.linkedit_segment_data.len() {
+    if signature_data.signature_segment_end_offset != signature_data.linkedit_segment_data.len() {
         problems.push(VerificationProblem {
             context: context.clone(),
             problem: VerificationProblemType::SignatureNotLastLinkeditData,
@@ -407,14 +378,6 @@ fn verify_code_directory(
     context: VerificationContext,
 ) -> Vec<VerificationProblem> {
     let mut problems = vec![];
-
-    match cd.digest_type {
-        DigestType::Sha256 | DigestType::Sha384 => {}
-        hash_type => problems.push(VerificationProblem {
-            context: context.clone(),
-            problem: VerificationProblemType::CodeDirectoryOldDigestAlgorithm(hash_type),
-        }),
-    }
 
     match macho.code_digests(cd.digest_type, cd.page_size as _) {
         Ok(digests) => {

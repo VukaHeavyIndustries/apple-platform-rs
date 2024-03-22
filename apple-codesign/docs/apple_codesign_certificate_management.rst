@@ -99,10 +99,46 @@ appears to require the use of RSA 2048 private keys.
 
 If you have access to macOS, the easiest way to generate a private key and
 CSR is to use ``Keychain Access`` using the
-`procedure outlined here <https://help.apple.com/developer-account/#/devbfa00fef7>`_.
+`procedure outlined here <https://developer.apple.com/help/account/create-certificates/create-a-certificate-signing-request>`_.
 
-If you want to generate your own CSR using ``rcodesign``, you can! First,
-you'll need a private key.
+If you want to generate your own CSR using ``rcodesign``, follow instructions
+in one of the following sections. If you already have a CSR, skip ahead to
+:ref:`apple_codesign_exchange_csr`.
+
+.. _apple_codesign_generate_csr_from_p12:
+
+Generating a CSR from a ``.p12`` / ``.pfx`` File
+------------------------------------------------
+
+If you've exported a ``.p12`` / ``.pfx`` / PKCS#12 file from
+``KeyChain Access.app`` or some other source, you can use ``rcodesign``
+to turn it into a CSR::
+
+   rcodesign generate-certificate-signing-request --p12-file cert.p12 --p12-password my-password
+
+This command will print the CSR to stdout. e.g.::
+
+    -----BEGIN CERTIFICATE REQUEST-----
+    MIHeMIGDAgEAMCExHzAdBgNVBAMMFkFwcGxlIENvZGUgU2lnbmluZyBDU1IwWTAT
+    BgcqhkjOPQIBBggqhkjOPQMBBwNCAAQxluBlPIv/HgBDz0O3GLPhhna/NJU7menq
+    GzUc9sZFOgZ7XmpR9vQTxHPEyg5D6huBapVQZsDG9IgAXjvSOmimoAAwDAYIKoZI
+    zj0EAwIFAANIADBFAiEAoZpbfrlm7HgQXByfwuoPt7/V+QM7DCIILcTKCBrkIZUC
+    IEIp8yA9bSg7bM9XJl8bgFesTjermlSYQI/2JY834/z7
+    -----END CERTIFICATE REQUEST-----
+
+You probably want to use ``--csr-pem-file`` to write that to a file automatically::
+
+   rcodesign generate-certificate-signing-request --p12-file cert.p12 --p12-password my-password --csr-pem-file csr.pem
+
+Generating a CSR From a YubiKey or Other SmartCard Device
+---------------------------------------------------------
+
+See the instructions at :ref:`apple_codesign_smartcard_key_generation`.
+
+.. _apple_codesign_generate_rsa_key_and_csr:
+
+Generating an RSA Private Key and CSR
+-------------------------------------
 
 To generate an RSA 2048 private key using OpenSSL::
 
@@ -115,26 +151,10 @@ To generate an RSA 2048 private key using OpenSSL::
 
 Then once you have a private key, we can generate a CSR using ``rcodesign``::
 
-    rcodesign generate-certificate-signing-request --pem-source private.pem
-    rcodesign generate-certificate-signing-request --p12-file key.p12
+    rcodesign generate-certificate-signing-request --pem-file private.pem
 
-    # Smart cards require generating a new key then creating a CSR from that key.
-    rcodesign smartcard-generate-key --smartcard-slot 9c
-    rcodesign generate-certificate-signing-request --smartcard-slot 9c
-
-This command will print the CSR to stdout. e.g.::
-
-    -----BEGIN CERTIFICATE REQUEST-----
-    MIHeMIGDAgEAMCExHzAdBgNVBAMMFkFwcGxlIENvZGUgU2lnbmluZyBDU1IwWTAT
-    BgcqhkjOPQIBBggqhkjOPQMBBwNCAAQxluBlPIv/HgBDz0O3GLPhhna/NJU7menq
-    GzUc9sZFOgZ7XmpR9vQTxHPEyg5D6huBapVQZsDG9IgAXjvSOmimoAAwDAYIKoZI
-    zj0EAwIFAANIADBFAiEAoZpbfrlm7HgQXByfwuoPt7/V+QM7DCIILcTKCBrkIZUC
-    IEIp8yA9bSg7bM9XJl8bgFesTjermlSYQI/2JY834/z7
-    -----END CERTIFICATE REQUEST-----
-
-You probably want to use ``--csr-pem-path`` to write that to a file automatically::
-
-   rcodesign generate-certificate-signing-request --smartcard-slot 9c --csr-pem-path csr.pem
+Like the instructions above, you probably want to use ``--csr-pem-file`` to save the
+CSR data to a file for submission to Apple.
 
 .. _apple_codesign_exchange_csr:
 

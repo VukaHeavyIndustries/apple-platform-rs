@@ -121,6 +121,8 @@ the following::
       - 1.2.840.113635.100.6.1.33 (DeveloperIdDate)
       - 1.2.840.113635.100.6.1.13 (DeveloperIdApplication)
 
+.. _apple_codesign_smartcard_key_generation:
+
 Creating a Certificate with a Private Key Exclusive to the Smart Card
 =====================================================================
 
@@ -145,7 +147,7 @@ Then create a certificate signing request (CSR)::
 
     rcodesign generate-certificate-signing-request \
         --smartcard-slot 9c \
-        --csr-pem-path csr.pem
+        --csr-pem-file csr.pem
 
 Then follow the instructions at :ref:`apple_codesign_exchange_csr` to submit the
 CSR file to Apple and obtain a *public certificate*.
@@ -153,7 +155,7 @@ CSR file to Apple and obtain a *public certificate*.
 Finally, import the Apple-issued public certificate into the smart card::
 
     rcodesign smartcard-import \
-        --der-source developerID_application.cer \
+        --certificate-der-file developerID_application.cer \
         --existing-key \
         --smartcard-slot 9c
 
